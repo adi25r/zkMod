@@ -57,5 +57,4 @@ wait $HPID
 rc=$?
 set -e
 echo "== harness exit $rc $(date)"
-python plots/parse_e2e.py "$RESULTS/summary.log" > "$RESULTS/h100_e2e.csv" || true
 exit $rc

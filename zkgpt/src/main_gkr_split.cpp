@@ -85,7 +85,7 @@ using namespace std;
 // prompt commit), the probe + 2*pow2(input+aux) half/half witness layout with the
 // weights at the midpoint, merge_layer on, and the merged range-query set. Only this
 // runner's machinery (forked --overlapped partitions, concurrent witgen, GPU
-// witgen/prover gates) is ours; the statement proved is the paper's. The switchable
+// witgen/prover gates) is ours. The switchable
 // sequence kernel (GKR_ARITH / GKR_MERGE / GKR_SPLIT_MINIMAL_LAYOUT / --chunk-width /
 // --corrupt-kv-* / --prompt-nonzero) no longer exists.
 // merge=1 for the builder AND range_prover's `merged` arg: the two must agree or the
@@ -122,15 +122,14 @@ struct SplitCfg {
     // Knob defaults snapshotted before any partition mutates gkr_config.
     int def_c = 0, def_mk = 0, def_rk = 0, def_ll = 0, def_lk = 0;
     // `len` is the CIRCUIT sequence width: next_pow2 of the --len argument (the
-    // block takes it as its len, the range prover as its seq_len). Both arms must use
+    // block takes it as its len, the range prover as its seq_len). Both paths must use
     // the same value or they size different circuits.
     std::string vram_csv;        // --vram-csv: device-wide sampler output
     // 1 ms: witgen's GPU duty is tens of ms of kernel spread over seconds, so a
     // coarser poll rarely lands on a live kernel and reports ~0%.
     double vram_interval = 0.001;  // --vram-interval seconds
     bool witgen_only = false;   // --witgen-only : build (+cache) every partition, skip
-                                // proving. Pairs with a later cache-warm normal run --
-                                // see tools/run_witgen_pipeline.py.
+                                // proving. Pairs with a later cache-warm normal run.
     std::size_t nparts() const { return split_depths.size(); }
 };
 
@@ -170,9 +169,8 @@ struct PartResult {
 };
 
 // A partition split at the same seam the upstream runner splits at: everything up to
-// and including create() is the "build the instance" phase that
-// main_demo_llm_split.cpp does before handing jobs to run_verifiers_parallel;
-// everything after is the per-job body those threads run.
+// and including create() is the "build the instance" phase; everything
+// after is the per-job body.
 struct PartitionState {
     std::unique_ptr<prover> p;
     std::unique_ptr<neuralNetwork> net;
@@ -266,7 +264,7 @@ static bool build_partition(const SplitCfg &cfg, std::size_t i,
 
     st.p.reset(new prover());
     st.p->max_threads = g_child_threads > 0 ? g_child_threads : cfg.num_threads;
-    // modular-zkp's block, its flags (main_demo_llm_split.cpp): output private unless
+    // modular-zkp's block and flags: output private unless
     // last, input private unless first, input committed separately on the first.
     st.net.reset(new LLMSplitBlock(cfg.split_depths[i], cfg.embed_size / 64, 64,
                                    cfg.embed_size, cfg.lin_dim, cfg.len,
@@ -279,7 +277,7 @@ static bool build_partition(const SplitCfg &cfg, std::size_t i,
     }
     st.net->on_values_ready = std::move(on_values_ready);
     st.net->on_before_values = std::move(on_before_values);
-    // Probed layout, also for the monolith (modular-zkp's main_demo_llm does the same).
+    // Probed layout, also for the monolith.
     // tiws[i]==0 would shift 1<<-1 in setTotalInputWitnessSize; the probe never yields 0.
     if (cfg.tiws[i] > 0)
         st.net->setTotalInputWitnessSize(cfg.tiws[i]);
@@ -375,8 +373,7 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
     zkgpt_phase::set_part((long long)i);
     // Deliberately ZKGPT_PHASE and not ZKGPT_PHASE_SCOPE: the ROCTx side of this exact
     // region is the enclosing ZKGPT_ROCTX_SCOPEF("part%zu") below, which the profiler
-    // needs as the PARTITION-owner range rather than as a phase (overlay_concurrent.py
-    // strips part<i> when attributing costs). Adding a second range named "prove" here
+    // needs as the PARTITION-owner range rather than as a phase. Adding a second range named "prove" here
     // would double-count every dispatch in the partition.
     ZKGPT_PHASE("prove");
     zkgpt_acct::reset();
@@ -436,7 +433,7 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
     }
     rp_build_timer.stop();
 
-    // Per-partition Blendy/deg3 sub-phase accounting, mirroring main_gkr.cpp.
+    // Per-partition Blendy/deg3 sub-phase accounting.
     // OFF by default: `.on` inserts hipStreamSynchronize inside product_sumcheck,
     // which perturbs the very launch/sync structure this is meant to measure. Enabled here rather than
     // around v.prove() alone so the RANGE prover's deg3 lands in the same window.
@@ -674,8 +671,7 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
                   << std::endl;
     }
     if (mm_prof) {
-        // Same field names as main_gkr.cpp so one parser reads both binaries.
-        auto& MT = zkgpt_gpu::g_matmul_timers;
+                auto& MT = zkgpt_gpu::g_matmul_timers;
         std::cout << "MATMUL_BREAKDOWN idx=" << i
                   << " expand_s="  << MT.expand
                   << " ptable_s="  << MT.ptable
@@ -821,8 +817,7 @@ static bool run_split_partitions(const SplitCfg &cfg, bool unique_parts, RunTota
     double total_output_commit_time = 0.0;
     double total_verifier_time = 0.0;
     double combined_proof_size_kb = 0.0;
-    // zkGPT's split baseline (main_demo_utils.hpp run_verifiers_parallel, default
-    // mode=0) reports the PARALLEL makespan: max over partitions of prover_time,
+    // zkGPT's split baseline reports the PARALLEL makespan: max over partitions of prover_time,
     // plus max over partitions of output_commit -- NOT the sum. We track both: the
     // max (zkGPT-comparable) and the sum (single-GPU sequential wall-clock).
     double max_prover_core   = 0.0;
@@ -945,9 +940,8 @@ static bool run_split_concurrent(const SplitCfg &cfg, int width) {
     const int w = (width > 0 && width < n) ? width : n;
 
     const int nwaves = (n + w - 1) / w;
-    // One host thread budget split across the concurrent children, as
-    // tools/run_parallel_partitions.py does. Giving each child the full count made the
-    // concurrent arm use W times the CPU of the sequential arm.
+    // One host thread budget split across the concurrent children. Giving each child the full count made the
+    // concurrent path use W times the CPU of the sequential path.
     const int tpc = std::max(1, cfg.num_threads / w);
     core_table_init(tpc);
 
@@ -2189,9 +2183,9 @@ int main(int argc, char **argv)
                                 || getenv("GKR_GELU_CHECK") != nullptr;
     bool witgen_only = false;    // --witgen-only : build+cache every partition, skip proving
     int  conc_width = 0;         // 0 => all partitions at once
-    // --threads-total: host thread budget. The sequential arm uses all of it; the
-    // concurrent arm splits it across children. Defaults to the positional `threads`
-    // so the two arms are comparable without extra flags.
+    // --threads-total: host thread budget. The sequential path uses all of it; the
+    // concurrent path splits it across children. Defaults to the positional `threads`
+    // so the two paths are comparable without extra flags.
     int  threads_total = 0;
     std::string vram_csv;
     double vram_interval = 0.001;
@@ -2207,7 +2201,7 @@ int main(int argc, char **argv)
             else if (a == "--lasso-l")    gkr_config.lasso_l    = next();
             else if (a == "--lasso-k")    gkr_config.lasso_k    = next();
             else if (a == "--sc-tile-bits") gkr_config.sc_tile_bits = next();
-            // Per-phase CPU reference arms, same names as main_gkr.cpp; they are how
+            // Per-phase CPU reference paths; they are how
             // each GPU offload below gets A/B'd.
             else if (a == "--cpu")        gkr_config.range_cpu  = true;
             else if (a == "--cpu-deg3")   gkr_config.deg3_cpu   = true;
@@ -2306,7 +2300,7 @@ int main(int argc, char **argv)
         int w = 1; while (w < len) w <<= 1;
         len = w;
     }
-    std::cerr << "[split] len=" << len << " merge=" << kMerge << " arith=paper" << std::endl;
+    std::cerr << "[split] len=" << len << " merge=" << kMerge << std::endl;
 
     // Probe pass: build each block's circuit (no commit) for total_input_witness_size
     // and shared_commit_sizes. Memoised on split_depth.
@@ -2342,7 +2336,7 @@ int main(int argc, char **argv)
         // Probes at splits=1 as well: modular-zkp's monolithic demo does
         // (nn_test.create -> getTotalInputSize -> setTotalInputWitnessSize), so the
         // monolith gets the same 2*pow2(input+aux) half/half layout as its partitions
-        // and the baseline differs from the arms in the split count only.
+        // and the baseline differs from the paths in the split count only.
         for (int i = 0; i < num_splits; ++i) {
             const int key = split_depths[i];
             auto it = probe_cache.find(key);
@@ -2369,7 +2363,7 @@ int main(int argc, char **argv)
                 if (pid < 0) { perror("probe fork"); exit(EXIT_FAILURE); }
                 if (pid == 0) {
                     close(fds[0]);
-                    // all-false flags, as the paper driver's probe: a private/separate
+                    // all-false flags: a private/separate
                     // input would take initParam's half/half branch with the default
                     // 2*pow2(prompt) size and refuse the weights. No commit happens here.
                     prover probe_p;

@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker
 import numpy as np
 
-import paperstyle as ps
+import plotstyle as ps
 import proof_size
 
 HERE = os.path.dirname(os.path.abspath(__file__))

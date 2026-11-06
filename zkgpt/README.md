@@ -12,10 +12,10 @@ Use the driver from the repository root. See the [top-level README](../README.md
 
 | Path | Contents |
 |---|---|
-| `src/` | Prover, verifier, circuit, entry points (`main_gkr_split.cpp`, `main_gkr.cpp`, `main_demo_llm_split.cpp`) |
+| `src/` | Prover, verifier, circuit, entry point (`main_gkr_split.cpp`) |
 | `gpu_provers/` | Sumcheck, range and Hyrax kernels, field bridge |
 | `witgen_gpu/` | GPU witness generation |
-| `tools/` | Experiment queues (`tools/results/figures/`), sweep drivers, plotting |
+| `tools/` | Experiment queues (`tools/results/figures/`) and plotting (`plot_figures.py`) |
 | `docs/` | [Architecture](docs/ARCHITECTURE.md), [build and run reference](docs/BUILD_AND_RUN.md) |
 
 `../mcl` and `../zkmod-gpu` are required siblings. CMake resolves them by relative path.

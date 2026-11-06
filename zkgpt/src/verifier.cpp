@@ -247,7 +247,7 @@ void verifier::predicatePhase2_cpu(int layer_id, F out[3])
 
 // GPU predicate dispatch. gkr_predicate{1,2}_gpu reduce every gate in the layer into
 // the 2 (resp. 3) accumulators; there is no output scatter, so no atomics and no
-// disjointness machinery. GKR_PRED_CPU=1 forces the host arm; GKR_PRED_CHECK=1 runs
+// disjointness machinery. GKR_PRED_CPU=1 forces the host path; GKR_PRED_CHECK=1 runs
 // BOTH per layer and asserts they agree exactly (field addition is exact and
 // reordering-invariant, so this is equality, not a tolerance).
 void verifier::predicatePhase1(int layer_id)
@@ -725,7 +725,7 @@ bool verifier::verifyGKR()
             auto _tsc = vl_clk::now();
             // NOVEL: run the matmul product-sumcheck on the GPU (Blendy kernels),
             // fed zkGPT's own challenges r_u[i]; returns the same (pa(r), pb(r)).
-            // GKR_MATMUL_CPU=1 restores the host path as the reference arm.
+            // GKR_MATMUL_CPU=1 restores the host path as the reference path.
             static const bool matmul_cpu = getenv("GKR_MATMUL_CPU") != nullptr;
             pair<Fr,Fr> oracle = matmul_cpu
                 ? sum_check_product(pa,pb,m-1,r_u[i].data(),prev_u1)
@@ -901,8 +901,8 @@ bool verifier::verifyLasso()
     int n=C.circuit[0].bit_length;
     F gr = F_ZERO;
     // Whole Lasso grand-product sumcheck on the GPU, fed zkGPT's r_u[0]; the CPU
-    // arm below is the same protocol. Both leave (eval_in, previousSum) for the
-    // beta-table check. GKR_LASSO_CPU=1 selects the reference arm.
+    // path below is the same protocol. Both leave (eval_in, previousSum) for the
+    // beta-table check. GKR_LASSO_CPU=1 selects the reference path.
     // No add_prover() here -- ptimer is charged ONCE at the end.
     static const bool lasso_cpu = getenv("GKR_LASSO_CPU") != nullptr;
     if (getenv("GKR_LASSO_STATS")) {   // diagnostic: sparsity/extent of the two Lasso sources

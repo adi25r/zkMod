@@ -23,8 +23,8 @@ CMake fixes the sibling paths as `${CMAKE_CURRENT_SOURCE_DIR}/..`, so the layout
 |---|---|
 | `./zkmod check` | Report toolchains, GPUs, dependencies, binaries, free VRAM and host memory |
 | `./zkmod deps` | Clone and build mcl, clone zkmod-gpu, at the pinned commits |
-| `./zkmod build zkgpt` | Configure into `build-scale`, build `main_gkr_split` and `zkgpt_gpu`, create the symlink `bin/main_gkr_split_witgen -> main_gkr_split` |
-| `./zkmod prove zkgpt --model M [--mode mono\|cpu\|gpu] [--len L] [--splits N] [--gpu G]` | One run. Mode defaults to `gpu`, `L` to 64. The log lands in `tools/results/figures/logs/`, or `LOGS`. Arm 0 accepts only gpt2 and opt350m. |
+| `./zkmod build zkgpt` | Configure into `build-scale`, build `bin/main_gkr_split` |
+| `./zkmod prove zkgpt --model M [--mode mono\|cpu\|gpu] [--len L] [--splits N] [--gpu G]` | One run. Mode defaults to `gpu`, `L` to 64. The log lands in `tools/results/figures/logs/`, or `LOGS`. `mono` accepts only gpt2 and opt350m. |
 | `./zkmod figures zkgpt --smoke [--gpu G]` | gpt2 `gpu` mode, then plot into `tools/results/figures/smoke/` |
 | `./zkmod figures zkgpt --full [--gpu G]` | Run `tools/results/figures/run_all.sh` |
 | `./zkmod figures zkgpt --plot [--logs DIR] [--out DIR] [fig ...]` | Plot only |
@@ -47,7 +47,7 @@ cmake -S . -B build-scale \
   "-DCMAKE_HIP_FLAGS=--rocm-path=/opt/rocm-scale -I/opt/rocm-6.4.3/lib/llvm/include" \
   "-DZKGPT_HIP_EXTRA_FLAGS=--rocm-path=/opt/rocm-scale;-std=gnu++20;-I/opt/rocm-6.4.3/lib/llvm/include" \
   "-DCMAKE_EXE_LINKER_FLAGS=-L/opt/rocm-scale/lib -L/opt/rocm-6.4.3/lib/llvm/lib -Wl,-rpath,/opt/rocm-scale/lib:/opt/rocm-6.4.3/lib/llvm/lib"
-cmake --build build-scale --target main_gkr_split zkgpt_gpu -j32
+cmake --build build-scale --target main_gkr_split -j32
 ```
 
 Why each part is there:
@@ -83,13 +83,6 @@ export LD_LIBRARY_PATH=/opt/rocm-scale/lib:/opt/rocm/lib:/opt/rocm/llvm/lib
 | Target | Extra defines | Purpose |
 |---|---|---|
 | `main_gkr_split` | | The split and monolith prover. Built by the driver. |
-| `main_gkr_split_witgen` | | Same sources. The driver replaces it with a symlink, and CMake can also build it as a separate binary. |
-| `main_gkr_split_roctx` | `ZKGPT_ROCTX` | ROCTx ranges for `tools/run_profiled.sh`. Links `/opt/rocm/lib/librocprofiler-sdk-roctx.so`. |
-| `main_gkr_split_uvm`, `zkgpt_gpu_uvm` | `GKR_UVM` | Managed-memory experiments. Do not launch new ones. |
-| `zkgpt_gpu` | | Single-proof driver (`src/main_gkr.cpp`), used by `tools/run_llm_demo.sh`. Built by the driver. |
-| `main_demo_llm_split`, `main_demo_llm_split_dbg` | | modular-zkp's demo driver on this prover |
-
-`tools/uvm_probe.cpp` has no CMake target.
 
 ## CLI
 
@@ -110,7 +103,7 @@ Defaults: depth 12, embed 768, splits 2, **len 30**, threads 32, `lin_dim = 3*em
 | `--lasso-l N`, `--lasso-ls` | Override `l_stage` directly. `k` takes priority. |
 | `--sc-tile-bits N` | Extension table tile bits |
 | `--splits a,b,c` | Explicit layer composition summing to depth. Overrides `num_splits`. |
-| `--cpu`, `--cpu-deg3`, `--cpu-open`, `--cpu-commit` | CPU reference arms: range deg1, range deg3, range open, Hyrax commit |
+| `--cpu`, `--cpu-deg3`, `--cpu-open`, `--cpu-commit` | CPU reference paths: range deg1, range deg3, range open, Hyrax commit |
 | `--concurrent [W]` | Run mode |
 | `--batched [B]`, `--pipeline [B]` | Run mode |
 | `--overlapped [B]`, `--witgen-chain [B]` | Run mode. `-1` is memory-gated. |
@@ -132,36 +125,6 @@ HIP_VISIBLE_DEVICES=1 ./bin/main_gkr_split 12 768 12 64 192 3072 --overlapped -1
 ```
 
 Check free VRAM first. A nearly full GPU produces an out-of-memory error at the first allocation. Most real runs should go through `./zkmod prove`, because the arm environment matters.
-
-### `zkgpt_gpu`
-
-```
-zkgpt_gpu L H head_dim attn_dim lin_dim [c] [k] [range_size] [flags]
-```
-
-`attn_dim` must equal `H*head_dim`. Unknown flags are silently ignored.
-
-| Flag | Effect |
-|---|---|
-| `--len N` | Sequence length, default 30 |
-| `--only-range`, `--skip-range` | Run only or skip the range prover |
-| `--cpu`, `--cpu-deg3`, `--cpu-open`, `--cpu-commit` | CPU reference arms |
-| `--corrupt-layer I`, `--corrupt-commit` | Soundness cheats |
-| `--matmul-l`, `--matmul-k`, `--lasso-l`, `--sc-tile-bits` | Knobs |
-| `--partitions`, `--vram-gb` | Range prover partitioning |
-| `--bench-deg1 N K`, `--bench-deg3 N`, `--bench-matmul N K` | Microbenchmarks, exit after |
-| `--dump-prefetch`, `--dump-callgraph`, `--dump-sizes`, `--gpu-bookkeep` | Debug flags |
-| `--uvm-prefetch`, `--uvm-zerocopy` | UVM binary only |
-
-`gpu_matmul_bookkeeping_sumcheck` exists in `gpu_matmul_prover.hpp`, but no code outside that header calls it, and setting `--gpu-bookkeep` only stores a config field.
-
-### `main_demo_llm_split`
-
-```
-main_demo_llm_split <threads> <depth> <embed> <num_splits> <len> <mode> [lin_dim] [merge]
-```
-
-Knobs come from `GKR_C`, `GKR_MATMUL_K`, `GKR_RANGE_K`, `GKR_LASSO_K`, `GKR_SC_TILE_BITS` and `GKR_RANGE_CPU_ALL`.
 
 ## Environment gates
 
@@ -187,7 +150,6 @@ grep -rhoE 'getenv\("[A-Za-z_0-9]+"\)' src gpu_provers witgen_gpu | sed 's/geten
 | `GKR_ROUND_GPU` | Round layer witgen on GPU |
 | `GKR_GATES_GPU` | Gate evaluator on GPU |
 | `GKR_WITGEN_FULL`, `GKR_GELU_GPU` | All builders on GPU. The second is an alias. |
-| `GKR_RANGE_CPU_ALL` | `main_demo_llm_split`: all range stages on host |
 | `HIP_VISIBLE_DEVICES` | Device selection. The gate also reads it for the VRAM check. |
 | `GKR_SPLIT_DEVICES=a,b` | Overlapped: round-robin children across devices |
 | `GKR_WITGEN_DEVICE=W` | Overlapped: controller owns witgen on device W |
@@ -217,7 +179,6 @@ grep -rhoE 'getenv\("[A-Za-z_0-9]+"\)' src gpu_provers witgen_gpu | sed 's/geten
 | `GKR_PROBE_CACHE=dir` | Probe cache directory, `0` disables. Default `$HOME/.cache/zkml_probe` (`HOME`). |
 | `ZKGPT_WITNESS_CACHE=dir` | Cache directory, `0` disables. **On by default**, at `<repo>/.witness_cache`. Benchmarks must set `0`. |
 | `ZKGPT_WEIGHT_SEED=n` | Weights as a function of partition index |
-| `GKR_DEMO_FORK`, `GKR_DEMO_FORK_MAX` | `main_demo_llm_split`: fork provers and cap their number |
 | `GKR_UVM_ZEROCOPY_GB` | UVM threshold, default 4 |
 | `ZKGPT_UVM_LOCK`, `ZKGPT_UVM_NO_LOCK` | UVM single-instance lock path and bypass |
 
@@ -227,7 +188,7 @@ grep -rhoE 'getenv\("[A-Za-z_0-9]+"\)' src gpu_provers witgen_gpu | sed 's/geten
 |---|---|
 | `GKR_TEST_INPUT=seed` | Nonzero prompt. Required for boundary tests. |
 | `GKR_TAMPER_CARRY=i` | Perturb partition i's carry, which must REJECT at `stage=boundary_link` |
-| `GKR_WITGEN_CHECK`, `GKR_ROUND_CHECK`, `GKR_GATES_CHECK` | Run both arms and assert equality |
+| `GKR_WITGEN_CHECK`, `GKR_ROUND_CHECK`, `GKR_GATES_CHECK` | Run both paths and assert equality |
 | `GKR_WITGEN_FULL_CHECK`, `GKR_GELU_CHECK` | Same for builders |
 | `GKR_PRED_CHECK` | Both predicate paths |
 | `GKR_BFEVAL_CHECK` | Compare `bf_eval` paths |
@@ -258,8 +219,6 @@ grep -rhoE 'getenv\("[A-Za-z_0-9]+"\)' src gpu_provers witgen_gpu | sed 's/geten
 | `GKR_TRACE_SEGMENTS` | Name each segment before opening it |
 | `ZKGPT_SAMPLER_PCI`, `ZKGPT_SAMPLER_KFD_GPU_ID` | Limit the sampler to one card |
 
-Variables that older documents name and the code does not read: `GKR_ARITH`, `GKR_MERGE`, `GKR_SPLIT_MINIMAL_LAYOUT`, `GKR_RANGE_CPU`, `GKR_OPEN_CPU`, `GKR_DEG3_CPU`, `GKR_RANGE_C`, `GKR_RANGE_K` (read only as `main_demo_llm_split`'s knob), `GKR_BENCH_*`, `GKR_DUMP_CALLGRAPH`, `GKR_DUMP_PREFETCH`, `GKR_ONLY_RANGE`, `GKR_CORRUPT_*`, `GKR_GPU_BOOKKEEP`, `GKR_SC_ASYNC`.
-
 `GPU_MAX_HW_QUEUES` is read by the HIP runtime, not this code. `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` is a glibc setting. No queue sets it.
 
 ## Log format
@@ -274,7 +233,7 @@ PHASE part=3 pid=48211 ev=end   phase=range_prove            d=1 t_us=1756812365
 PHASE part=-1 pid=48200 ev=mark  phase=release_wave0         d=0 t_us=1756812301004112
 ```
 
-`part=-1` is the parent. `d` is nesting depth. `src/main_gkr.cpp` prints a different `PHASE name=...` form.
+`part=-1` is the parent. `d` is nesting depth.
 
 | Phase | Meaning |
 |---|---|
@@ -333,7 +292,7 @@ One per partition, on stdout.
 
 ## Checking soundness by hand
 
-The cheats are flags: `--corrupt-layer 0..3` and `--corrupt-commit` on `bin/zkgpt_gpu`, which must not end in `RESULT: ACCEPT`. Test boundary linking with `GKR_TAMPER_CARRY` and `GKR_TEST_INPUT`.
+Test boundary linking with `GKR_TAMPER_CARRY` and `GKR_TEST_INPUT`.
 
 ## Operational hazards
 

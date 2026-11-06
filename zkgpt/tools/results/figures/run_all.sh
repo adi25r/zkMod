@@ -34,7 +34,7 @@ if [[ "${1:-}" != "--plot" ]]; then
   note "zkgptseqlenscaling + zkgptpartitionscaling";  $Q/run_zkgpt_scaling.sh
   # The baseline's t192 run is the len-64 monolith (same flags, same binary).
   L=tools/results/figures/logs
-  for m in gpt2 opt350m; do [[ -f $L/${m}_arm0_mono.log ]] || cp -p "$L/${m}_t192_cpu.log" "$L/${m}_arm0_mono.log"; done
+  for m in gpt2 opt350m; do [[ -f $L/${m}_mono.log ]] || cp -p "$L/${m}_t192_mono.log" "$L/${m}_mono.log"; done
   note "seqlen64allcpu + seqlen64allgpu";     $Q/run_seqlen64.sh
   note "cpuhostthreadscaling";                $Q/run_cpuhostthreadscaling.sh
 fi

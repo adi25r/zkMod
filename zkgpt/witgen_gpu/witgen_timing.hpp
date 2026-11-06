@@ -27,7 +27,7 @@ struct Accum {
     double create_s = 0;   // whole neuralNetwork::create() call
     double fc_s     = 0;   // fullyConnLayer only (the ~97% of field mults)
     double gates_s  = 0;   // all other layer builders + calcNormalLayer
-    double h2d_s    = 0;   // reserved: staging, when the GPU arm is active
+    double h2d_s    = 0;   // reserved: staging, when the GPU path is active
 
     // Per-builder breakdown, enabled with GKR_WITGEN_PROF=1. fc_s above is the only
     // one that is always on; the rest attribute the "gates_s" (build_s - fc_s) residual.
@@ -59,7 +59,7 @@ struct Accum {
     // Host CPU time consumed by witness generation, from getrusage deltas across
     // the whole of create(). user+sys over wall is the mean number of cores busy:
     // ~1.0 means the phase is single-threaded (neuralNetwork.cpp has no OpenMP),
-    // and on the GPU arms it says how much host work is left rather than how fast
+    // and on the GPU paths it says how much host work is left rather than how fast
     // the kernels are.
     double cpu_user_s = 0, cpu_sys_s = 0, wall_s = 0;
 

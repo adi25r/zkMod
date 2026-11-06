@@ -1,8 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-# Self-contained GPU zkGPT fork.
-# Builds a single binary `zkgpt_gpu` from zkgpt-gpu/src with the GKR GPU kernels,
-# and (Phase 1+) the Blendy matmul + Lasso range-check GPU provers wired in.
+# Builds bin/main_gkr_split: the zkGPT prover with the GPU kernels and zkMod partitioning.
 # All integration source lives under zkgpt-gpu/ (src/ + gpu_provers/). The Blendy
 # kernel headers (blendysc.hpp, blendy_linear.hpp, common.hpp) and common.cpp were
 # vendored from core_work into gpu_provers/ + src/, so there is no core_work
@@ -32,7 +30,7 @@ if(ZKGPT_HOST_GXX)
     endif()
 endif()
 
-project(zkgpt_gpu LANGUAGES CXX HIP)
+project(zkgpt LANGUAGES CXX HIP)
 
 set(OPT_FLAGS "-O2 -g")
 set(CMAKE_CXX_STANDARD 20)
@@ -151,65 +149,6 @@ set(ZKGPT_COMMON_SRC
     ${SRC_DIR}/common.cpp
 )
 
-set(ZKGPT_GPU_SRC
-    ${SRC_DIR}/main_gkr.cpp
-    ${SRC_DIR}/config.cpp
-    ${SRC_DIR}/circuit.cpp
-    ${SRC_DIR}/hyrax.cpp
-    ${SRC_DIR}/hyrax_rp.cpp
-    ${SRC_DIR}/prover.cpp
-    ${SRC_DIR}/verifier.cpp
-    ${SRC_DIR}/range_prover.cpp        # NOVEL: GPU chunked-lookup range check (logup)
-    ${SRC_DIR}/neuralNetwork.cpp
-    ${SRC_DIR}/models.cpp
-    ${SRC_DIR}/polynomial.cpp
-    ${SRC_DIR}/utils.cpp
-    ${SRC_DIR}/timer.cpp
-    ${SRC_DIR}/gkr_gpu.cpp
-    ${SRC_DIR}/gkr_pred_gpu.cpp   # GPU predicate reduction (generic-GKR finalize buckets)
-    ${SRC_DIR}/common.cpp                           # helpers used by Blendy kernels (vendored)
-)
-
-set_source_files_properties(${ZKGPT_GPU_SRC} PROPERTIES LANGUAGE HIP)
-
-add_executable(zkgpt_gpu ${ZKGPT_GPU_SRC})
-target_compile_definitions(zkgpt_gpu PRIVATE MCL_FP_BIT=384 ZKGPT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(zkgpt_gpu PRIVATE bls12_381_core mcl pthread gomp)
-target_include_directories(zkgpt_gpu PRIVATE
-    ${SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_provers
-    ${CMAKE_CURRENT_SOURCE_DIR}/witgen_gpu   # NOVEL: GPU witness generation  # NOVEL: GPU matmul/range bridges + vendored Blendy kernel headers
-    ${ROOT_DIR}/zkmod-gpu/src            # bls12_381.hpp
-    ${MCL_INCLUDE_DIR}
-)
-set_target_properties(zkgpt_gpu PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
-    HIP_SEPARABLE_COMPILATION ON
-    LINKER_LANGUAGE HIP)
-target_compile_options(zkgpt_gpu PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
-target_link_options(zkgpt_gpu PRIVATE -fopenmp)
-
-# UVM variant: identical to zkgpt_gpu but the matmul product-sumcheck working
-# buffers are allocated as managed memory (GKR_UVM). Experiment 3: lets a layer
-# oversubscribe physical VRAM via page migration. Run with HSA_XNACK=1.
-add_executable(zkgpt_gpu_uvm ${ZKGPT_GPU_SRC})
-target_compile_definitions(zkgpt_gpu_uvm PRIVATE MCL_FP_BIT=384 GKR_UVM ZKGPT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(zkgpt_gpu_uvm PRIVATE bls12_381_core mcl pthread gomp)
-target_include_directories(zkgpt_gpu_uvm PRIVATE
-    ${SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_provers
-    ${CMAKE_CURRENT_SOURCE_DIR}/witgen_gpu   # NOVEL: GPU witness generation
-    ${ROOT_DIR}/zkmod-gpu/src
-    ${MCL_INCLUDE_DIR}
-)
-set_target_properties(zkgpt_gpu_uvm PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
-    HIP_SEPARABLE_COMPILATION ON)
-target_compile_options(zkgpt_gpu_uvm PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
-target_link_options(zkgpt_gpu_uvm PRIVATE -fopenmp)
-
 # Split-block proof runner.
 set(ZKGPT_SPLIT_SRC ${SRC_DIR}/main_gkr_split.cpp ${SRC_DIR}/alloc_trace.cpp ${ZKGPT_COMMON_SRC})
 set_source_files_properties(${ZKGPT_SPLIT_SRC} PROPERTIES LANGUAGE HIP)
@@ -232,113 +171,6 @@ set_target_properties(main_gkr_split PROPERTIES
 target_compile_options(main_gkr_split PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
 target_link_options(main_gkr_split PRIVATE -fopenmp)
-# GPU-witness-generation twin of main_gkr_split, as a SEPARATE binary for the same
-# reason as the ROCTx one: a sweep is usually running off bin/main_gkr_split, and
-# relinking it underneath a live process risks ETXTBSY. Identical sources and flags;
-# the GPU witgen path is selected at RUNTIME by GKR_WITGEN_GPU, so this binary is
-# byte-equivalent in behaviour to main_gkr_split when the gate is unset.
-add_executable(main_gkr_split_witgen ${ZKGPT_SPLIT_SRC})
-target_compile_definitions(main_gkr_split_witgen PRIVATE MCL_FP_BIT=384 ZKGPT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(main_gkr_split_witgen PRIVATE bls12_381_core mcl pthread gomp)
-target_include_directories(main_gkr_split_witgen PRIVATE
-    ${SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_provers
-    ${CMAKE_CURRENT_SOURCE_DIR}/witgen_gpu   # NOVEL: GPU witness generation
-    ${ROOT_DIR}/zkmod-gpu/src
-    ${MCL_INCLUDE_DIR}
-)
-set_target_properties(main_gkr_split_witgen PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
-    HIP_SEPARABLE_COMPILATION ON)
-target_compile_options(main_gkr_split_witgen PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
-target_link_options(main_gkr_split_witgen PRIVATE -fopenmp)
-
-# ROCTx-instrumented twin of main_gkr_split, as a SEPARATE binary so a profiling build
-# never silently replaces the one a sweep is running. Same sources, same flags, plus
-# ZKGPT_ROCTX. Drive it with tools/run_profiled.sh.
-add_executable(main_gkr_split_roctx ${ZKGPT_SPLIT_SRC})
-target_compile_definitions(main_gkr_split_roctx PRIVATE
-    MCL_FP_BIT=384 ZKGPT_ROCTX ZKGPT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(main_gkr_split_roctx PRIVATE bls12_381_core mcl pthread gomp
-    /opt/rocm/lib/librocprofiler-sdk-roctx.so)
-target_include_directories(main_gkr_split_roctx PRIVATE
-    ${SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_provers
-    ${CMAKE_CURRENT_SOURCE_DIR}/witgen_gpu   # NOVEL: GPU witness generation
-    ${ROOT_DIR}/zkmod-gpu/src
-    ${MCL_INCLUDE_DIR}
-)
-set_target_properties(main_gkr_split_roctx PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
-    HIP_SEPARABLE_COMPILATION ON)
-target_compile_options(main_gkr_split_roctx PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
-target_link_options(main_gkr_split_roctx PRIVATE -fopenmp)
-
-# UVM variant of the split runner. Needed because the monolithic zkgpt_gpu_uvm
-# CANNOT build Llama-8B at depth 32 -- neuralNetwork.cpp asserts in
-# calcInputLayer during circuit construction, before any proving happens. The
-# split runner is the only path that builds 8B, so measuring UVM at 8B requires
-# a managed-memory build of *it*, not of zkgpt_gpu.
-add_executable(main_gkr_split_uvm ${ZKGPT_SPLIT_SRC})
-target_compile_definitions(main_gkr_split_uvm PRIVATE MCL_FP_BIT=384 GKR_UVM ZKGPT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(main_gkr_split_uvm PRIVATE bls12_381_core mcl pthread gomp)
-target_include_directories(main_gkr_split_uvm PRIVATE
-    ${SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_provers
-    ${CMAKE_CURRENT_SOURCE_DIR}/witgen_gpu   # NOVEL: GPU witness generation
-    ${ROOT_DIR}/zkmod-gpu/src
-    ${MCL_INCLUDE_DIR}
-)
-set_target_properties(main_gkr_split_uvm PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
-    HIP_SEPARABLE_COMPILATION ON)
-target_compile_options(main_gkr_split_uvm PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
-target_link_options(main_gkr_split_uvm PRIVATE -fopenmp)
-
-# modular-zkp's split demo driver (LLMSplitBlock, probe + half/half layout, merge flag,
-# merged range set), built against THIS repo's prover so the CPU and GPU arms share
-# the paper repo's arithmetization exactly; only the prover kernels differ (env gates).
-set(ZKGPT_DEMO_SPLIT_SRC ${SRC_DIR}/main_demo_llm_split.cpp ${SRC_DIR}/alloc_trace.cpp ${ZKGPT_COMMON_SRC})
-set_source_files_properties(${ZKGPT_DEMO_SPLIT_SRC} PROPERTIES LANGUAGE HIP)
-add_executable(main_demo_llm_split ${ZKGPT_DEMO_SPLIT_SRC})
-target_compile_definitions(main_demo_llm_split PRIVATE MCL_FP_BIT=384 ZKGPT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(main_demo_llm_split PRIVATE bls12_381_core mcl pthread gomp)
-target_include_directories(main_demo_llm_split PRIVATE
-    ${SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_provers
-    ${CMAKE_CURRENT_SOURCE_DIR}/witgen_gpu
-    ${ROOT_DIR}/zkmod-gpu/src
-    ${MCL_INCLUDE_DIR}
-)
-set_target_properties(main_demo_llm_split PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
-    HIP_SEPARABLE_COMPILATION ON)
-target_compile_options(main_demo_llm_split PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
-target_link_options(main_demo_llm_split PRIVATE -fopenmp)
-
-# debug twin (separate binary so a running measurement is never relinked underneath)
-set(ZKGPT_DEMO_SPLIT_DBG_SRC ${SRC_DIR}/main_demo_llm_split.cpp ${SRC_DIR}/alloc_trace.cpp ${ZKGPT_COMMON_SRC})
-set_source_files_properties(${ZKGPT_DEMO_SPLIT_DBG_SRC} PROPERTIES LANGUAGE HIP)
-add_executable(main_demo_llm_split_dbg ${ZKGPT_DEMO_SPLIT_DBG_SRC})
-target_compile_definitions(main_demo_llm_split_dbg PRIVATE MCL_FP_BIT=384 ZKGPT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(main_demo_llm_split_dbg PRIVATE bls12_381_core mcl pthread gomp)
-target_include_directories(main_demo_llm_split_dbg PRIVATE
-    ${SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_provers
-    ${CMAKE_CURRENT_SOURCE_DIR}/witgen_gpu
-    ${ROOT_DIR}/zkmod-gpu/src
-    ${MCL_INCLUDE_DIR}
-)
-set_target_properties(main_demo_llm_split_dbg PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
-    HIP_SEPARABLE_COMPILATION ON)
-target_compile_options(main_demo_llm_split_dbg PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:${ZKGPT_RDC_FLAG}> -fopenmp)
-target_link_options(main_demo_llm_split_dbg PRIVATE -fopenmp)
 
 # alloc_trace.cpp replaces the global operator new, which nvcc treats as device-callable, where its `throw` is
 # rejected. It is host-only code, so on the NVIDIA backend compile it as plain C++ (after the LANGUAGE HIP lists above).

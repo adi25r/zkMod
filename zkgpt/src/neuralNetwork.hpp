@@ -154,7 +154,7 @@ protected:
     void calcInputLayer(layer &circuit);
 
     void calcNormalLayer(const layer &circuit, i64 layer_id,bool output=false);
-    // Host reference arm for calcNormalLayer's gate replay, writing into a
+    // Host reference path for calcNormalLayer's gate replay, writing into a
     // caller-supplied buffer so GKR_GATES_CHECK can compare it against the GPU
     // result. Pre: out has circuit.size elements.
     void calcNormalLayer_cpu(const layer &circuit, i64 layer_id, F *out);
@@ -209,7 +209,7 @@ protected:
     void addBiasLayer(layer &circuit, i64 &layer_id, i64 first_bias_id);
 
     void roundLayer(layer &circuit, i64 &layer_id, float scale,bool* sparsity_map=NULL);
-    // Host reference arm for roundLayer's per-element value loop. Pre: out
+    // Host reference path for roundLayer's per-element value loop. Pre: out
     // has 2*block_len capacity. Post: out[0..block_len) = the "qq" (rounded
     // value) half, out[block_len..2*block_len) = the "s" (delta-check) half
     // -- same layout as val[0][qq_base..qq_base+2*block_len) in roundLayer.
@@ -260,11 +260,11 @@ protected:
                                      i64 orgsize, i64 block_len, int real_cn_in);
 
     void gelu_checker_layer1(layer &circuit, i64 &layer_id, int real_cn_out, int ea,int ca,int eb,int cb,int ec,int cc,int ed,int cd,int ex,int cx,int ey,int cy);
-    // Host reference arm for gelu_checker_layer1's value loop, writing into a
+    // Host reference path for gelu_checker_layer1's value loop, writing into a
     // caller-supplied advice block so GKR_GELU_CHECK can compare it against the
     // GPU result. Pre: out has 10 + 3*block_len + 3*len*real_cn_out elements,
     // zeroed (padding columns are skipped, not written).
-    // Host reference arm for gelu_checker_layer1's gate emission. Appends in the
+    // Host reference path for gelu_checker_layer1's gate emission. Appends in the
     // original order, which initSubset depends on.
     void gelu_checker_layer1_cpu_gates(std::vector<uniGate> &uni,
                                        std::vector<binGate> &bin,
@@ -289,11 +289,11 @@ protected:
                                        i64 orgsize, i64 block_len, int real_cn_out);
 
     void fullyConnLayer(layer &circuit, i64 &layer_id, i64 first_fc_id, i64 x_offset,int x_layer);
-    // Host reference arm for fullyConnLayer, writing into a caller-supplied
+    // Host reference path for fullyConnLayer, writing into a caller-supplied
     // buffer so GKR_WITGEN_CHECK can compare it against the GPU result.
     void fullyConnLayer_cpu(F *out, i64 first_fc_id, i64 x_offset, int x_layer);
 
-    // fc->round residency handoff: fullyConnLayer's GPU arm leaves its output in
+    // fc->round residency handoff: fullyConnLayer's GPU path leaves its output in
     // VRAM for roundLayer to consume in place. void* keeps this header HIP-free
     // (real type zkgpt_gpu::gpu_fe*). Whoever clears fc_resident_dev frees it;
     // layer/elems are the guard, so roundLayer fuses only on an exact match.

@@ -8,10 +8,10 @@ Reads tools/results/figures/logs/ (written by the queues in tools/results/figure
 tools/results/figures/figs/ (<name>.png, .pdf and a .md table with the exact values).
 
 Log naming (all produced by bin/main_gkr_split / _witgen; one run per file):
-    <model>_t<T>_cpu.log                               monolith thread series
-    <model>[_len<L>][_s<n>]_arm0_mono.log                 CPU monolith (splits=1)
-    <model>[_len<L>][_s<n>]_arm1_cpuwg_cpuprove.log       zkMod CPU witgen + CPU prove
-    <model>[_len<L>][_s<n>]_arm4_gpuwg_gpuprove.log       zkMod GPU witgen + GPU prove
+    <model>_t<T>_mono.log                                 monolith thread series
+    <model>[_len<L>][_s<n>]_mono.log                 CPU monolith (splits=1)
+    <model>[_len<L>][_s<n>]_cpu.log       zkMod CPU witgen + CPU prove
+    <model>[_len<L>][_s<n>]_gpu.log       zkMod GPU witgen + GPU prove
 
 Metric conventions (shared by every figure):
     witgen / prove       PHASE ev=end phase=witgen|prove dur_s (wall clock)
@@ -89,19 +89,19 @@ def suffix(length=64, splits=None):
 
 
 def mono(model, length=64):
-    return parse(f"{model}{suffix(length)}_arm0_mono.log")
+    return parse(f"{model}{suffix(length)}_mono.log")
 
 
-ARMS = {1: ("arm1_cpuwg_cpuprove", "CPU witgen + CPU prove"),
-        4: ("arm4_gpuwg_gpuprove", "GPU witgen + GPU prove")}
+MODES = {1: ("cpu", "CPU witgen + CPU prove"),
+        4: ("gpu", "GPU witgen + GPU prove")}
 
 
-def arm(model, k, length=64, splits=None):
-    return parse(f"{model}{suffix(length, splits)}_{ARMS[k][0]}.log")
+def zkmod_run(model, k, length=64, splits=None):
+    return parse(f"{model}{suffix(length, splits)}_{MODES[k][0]}.log")
 
 
 def ours(model, length=64, splits=None):
-    return arm(model, 4, length, splits)
+    return zkmod_run(model, 4, length, splits)
 
 
 def tx_s(proof_kb):
@@ -116,7 +116,7 @@ def proof_kb(r, model=None):
     if "proof_kb" in r["summ"]:
         return r["summ"]["proof_kb"]
     # Proof size is fixed by the circuit + partitioning, not by which device proved
-    # it: an arm1-3 log from before the field existed takes arm4's value.
+    # it: a CPU log from before the field existed takes the GPU run's value.
     o = ours(model) if model else None
     if o and o is not r and o["n"] == r["n"]:
         return proof_kb(o, model)
@@ -132,7 +132,7 @@ def verifier_s(r, model=None, serial=False):
         return agg(p["verifier_s"] for p in P.values())
     if len(P) == 1 and "verifier_sum" in r["summ"]:
         return r["summ"]["verifier_sum"]
-    # The verifier is the same host code in every arm; same fallback as proof_kb.
+    # The verifier is the same host code in every mode; same fallback as proof_kb.
     o = ours(model) if model else None
     if o and o is not r and o["n"] == r["n"]:
         return verifier_s(o, model, serial)
@@ -169,7 +169,7 @@ def save(fig, name, table, tight=True):
     print(f"-- {name}"); print("\n".join(table))
 
 
-# ---------------------------------------------------------------- paper style
+# ---------------------------------------------------------------- plot style
 # Bars: blue gradient (light = monolith/host, dark = zkMod/device), monolith hatched.
 # Lines: black, told apart by marker + line style. No titles or value labels except zkMod's speedup over the
 # monolith (_sp) -- the .md table carries the rest. Legends stay inside the axes.
@@ -222,7 +222,7 @@ def zkgptbaselineprofile():
     data = {}
     for m in models:
         for f in os.listdir(LOGS):
-            t = re.fullmatch(rf"{m}_t(\d+)_cpu\.log", f)
+            t = re.fullmatch(rf"{m}_t(\d+)_mono\.log", f)
             r = parse(f) if t and (int(t.group(1)) in (1, 2, 4) or int(t.group(1)) % 8 == 0) else None
             if r:
                 data[(m, int(t.group(1)))] = (r["phases"][(0, "witgen")], r["phases"][(0, "prove")])
@@ -273,7 +273,7 @@ def _seqlen64(k, name, series):
     for m, _ in MODELS:
         b = mono(m)
         if b: rows[(m, "base")] = metrics(b, m)
-        r = arm(m, k)
+        r = zkmod_run(m, k)
         if r: rows[(m, k)] = metrics(r, m)
     if not rows:
         print(f"{name}: no data"); return
@@ -322,7 +322,7 @@ def zkgpt_proof_overheads():
     (max over partitions); "-" = no run."""
     rows = {}
     for m, _ in MODELS:
-        b, r = mono(m), arm(m, 4)
+        b, r = mono(m), zkmod_run(m, 4)
         if b: rows[(m, "base")] = metrics(b, m)
         if r: rows[(m, 4)] = metrics(r, m)
     if not rows:
@@ -442,7 +442,6 @@ def zkgptpartitionscaling():
 
 
 
-# ---------------------------------------------------------------- paper: all models, one arm
 
 
 
@@ -454,20 +453,20 @@ def cpuhostthreadscaling(models=("gpt2", "opt350m"), name="cpuhostthreadscaling"
     zkMod at t threads: logs/threads/t<t>/, except the default budget (its own log)."""
     tdir = os.path.join(LOGS, "threads")
     budgets = sorted({int(d[1:]) for d in os.listdir(tdir) if re.fullmatch(r"t\d+", d)} if os.path.isdir(tdir) else set())
-    # run_cpuhostthreadscaling.sh writes flat logs/<model>_t<T>_arm1_cpuwg_cpuprove.log
+    # run_cpuhostthreadscaling.sh writes flat logs/<model>_t<T>_cpu.log
     budgets = sorted(set(budgets) | {int(t) for f in os.listdir(LOGS)
-                                      for t in re.findall(rf"^(?:gpt2|opt350m)_t(\d+)_{ARMS[1][0]}\.log$", f)})
+                                      for t in re.findall(rf"^(?:gpt2|opt350m)_t(\d+)_{MODES[1][0]}\.log$", f)})
     rows = {}
     for m in models:
-        a1 = arm(m, 1)
+        a1 = zkmod_run(m, 1)
         if a1:
-            t0 = int(re.search(r"threads=(\d+)", open(os.path.join(LOGS, f"{m}_{ARMS[1][0]}.log")).read()).group(1))
+            t0 = int(re.search(r"threads=(\d+)", open(os.path.join(LOGS, f"{m}_{MODES[1][0]}.log")).read()).group(1))
             rows[(m, t0, "ours")] = metrics(a1, m)
             budgets = sorted(set(budgets) | {t0})
         for t in budgets:
-            r = parse(os.path.join("threads", f"t{t}", f"{m}_{ARMS[1][0]}.log")) or parse(f"{m}_t{t}_{ARMS[1][0]}.log")
+            r = parse(os.path.join("threads", f"t{t}", f"{m}_{MODES[1][0]}.log")) or parse(f"{m}_t{t}_{MODES[1][0]}.log")
             if r: rows[(m, t, "ours")] = metrics(r, m)
-            b = parse(f"{m}_t{t}_cpu.log")
+            b = parse(f"{m}_t{t}_mono.log")
             if b: rows[(m, t, "base")] = metrics(b, m)
     if not rows:
         print("cpuhostthreadscaling: no data"); return
@@ -507,7 +506,6 @@ def cpuhostthreadscaling(models=("gpt2", "opt350m"), name="cpuhostthreadscaling"
     save(fig, name, tbl, tight=False)
 
 
-# ---------------------------------------------------------------- paper: partition scaling, both models
 
 
 # The TIMING_SPLIT hierarchy, summed over a run's partitions: witness-generation phase

@@ -837,10 +837,10 @@ std::ostream& operator<<(std::ostream& os, __int128_t value) {
         os << val;
     } while (1);
 }
-// Host reference arms for ln_checker_layer1. Bodies are the original loops
+// Host reference paths for ln_checker_layer1. Bodies are the original loops
 // verbatim; the value loop writes into an advice-block-relative buffer (index 0
-// == val[0][orgsize]). positive_check is bumped by the caller in both arms so
-// the counter does not depend on which arm ran.
+// == val[0][orgsize]). positive_check is bumped by the caller in both paths so
+// the counter does not depend on which path ran.
 void neuralNetwork::ln_checker_layer1_cpu_values(
         F *out, i64 orgsize, i64 block_len, int real_cn_in,
         i64 qw_off, i64 qb_off, int c1, int e1, int c2, int e2, int m,
@@ -1049,7 +1049,7 @@ void neuralNetwork::ln_checker_layer1(layer &circuit, i64 &layer_id, int ln_id, 
     layer_id++;
 }
 
-// Host reference arm for ln_checker_layer2's gate emission. The dead
+// Host reference path for ln_checker_layer2's gate emission. The dead
 // `SUM += cir*cir` from the original (a convert() per element whose result was
 // never read) is not reproduced -- it emitted no gate.
 void neuralNetwork::ln_checker_layer2_cpu_gates(
@@ -1181,7 +1181,7 @@ void neuralNetwork::ln_checker_layer2(layer &circuit, i64 &layer_id, int ln_id, 
     layer_id++;
 }
 
-// Host reference arm for ln_checker_layer3's gate emission.
+// Host reference path for ln_checker_layer3's gate emission.
 void neuralNetwork::ln_checker_layer3_cpu_gates(
         std::vector<uniGate> &uni, std::vector<binGate> &bin,
         i64 orgsize, i64 block_len, int real_cn_in)
@@ -1237,7 +1237,7 @@ void neuralNetwork::ln_checker_layer3(layer &circuit, i64 &layer_id, int ln_id, 
 
 
 
-// Host reference arm for gelu_checker_layer1's per-element value loop, kept as
+// Host reference path for gelu_checker_layer1's per-element value loop, kept as
 // the A/B target for the GPU kernel. Body is the original loop verbatim; only
 // the destination changed -- `out` is the advice block base, so every offset
 // that read `orgsize + k` now reads `out[k]`, and GKR_GELU_CHECK can run it
@@ -1297,7 +1297,7 @@ void neuralNetwork::gelu_checker_layer1_cpu_values(
     out[0]=1;
 }
 
-// Host reference arm for gelu_checker_layer1's gate emission, kept as the A/B
+// Host reference path for gelu_checker_layer1's gate emission, kept as the A/B
 // target for the GPU kernel. Body is the original loop verbatim, appending to
 // caller-supplied lists. ORDER IS PART OF THE CONTRACT -- initSubset assigns
 // each layer's subset indices by first occurrence, so the GPU kernel's slots
@@ -1377,7 +1377,7 @@ void neuralNetwork::gelu_checker_layer1(layer &circuit, i64 &layer_id, int real_
     total_relu_in_size += 10+ len*real_cn_out*3 + block_len*3;
 
     // Opt-IN, same precedent as fullyConnLayer's witgen_gpu and roundLayer's
-    // round_gpu: a new kernel defaults off; --gelu-check runs both arms and
+    // round_gpu: a new kernel defaults off; --gelu-check runs both paths and
     // asserts field equality. Read per call (not cached) so --witgen-chain can
     // flip it between the parent's probe pass and the children.
     const bool wg_gpu   = gkr_config.witgen_full;
@@ -1387,10 +1387,10 @@ void neuralNetwork::gelu_checker_layer1(layer &circuit, i64 &layer_id, int real_
         std::vector<uniGate> ref_uni;
         std::vector<binGate> ref_bin;
         if (wg_check) {
-            // Snapshot the host arms BEFORE the GPU overwrites val[0], then
+            // Snapshot the host paths BEFORE the GPU overwrites val[0], then
             // compare. Gate ORDER is part of the contract: initSubset assigns
             // subset indices by first occurrence, so a reordered list is a
-            // different circuit -- and both arms would still ACCEPT their own
+            // different circuit -- and both paths would still ACCEPT their own
             // statement, so only this check catches it.
             std::vector<F> ref(gelu1_alloc);
             for (auto &x : ref) x.clear();
@@ -1451,7 +1451,7 @@ void neuralNetwork::gelu_checker_layer1(layer &circuit, i64 &layer_id, int real_
     layer_id++;
 } 
 
-// Host reference arm for gelu_checker_layer2's gate emission. Order is part of
+// Host reference path for gelu_checker_layer2's gate emission. Order is part of
 // the contract -- see wg_check_gates.
 void neuralNetwork::gelu_checker_layer2_cpu_gates(
         std::vector<uniGate> &uni, std::vector<binGate> &bin,
@@ -1557,7 +1557,7 @@ void neuralNetwork::gelu_checker_layer2(layer &circuit, i64 &layer_id, int real_
 } 
 
 
-// Host reference arm for gelu_checker_layer3's gate emission.
+// Host reference path for gelu_checker_layer3's gate emission.
 void neuralNetwork::gelu_checker_layer3_cpu_gates(
         std::vector<uniGate> &uni, std::vector<binGate> &bin,
         i64 orgsize, i64 block_len, int real_cn_out)
@@ -1611,7 +1611,7 @@ void neuralNetwork::gelu_checker_layer3(layer &circuit, i64 &layer_id,int real_c
 } 
 
 
-// Idempotent; safe with no HIP context (only a GPU arm ever sets the pointer).
+// Idempotent; safe with no HIP context (only a GPU path ever sets the pointer).
 void neuralNetwork::releaseFcResident()
 {
     if (fc_resident_dev == nullptr) return;
@@ -1622,7 +1622,7 @@ void neuralNetwork::releaseFcResident()
 }
 
 // we place the computation of after fcon layer here
-// Host reference arm, kept as the A/B target for the GPU kernel. Body is the
+// Host reference path, kept as the A/B target for the GPU kernel. Body is the
 // original per-element loop verbatim; only the destination is now a
 // parameter so GKR_ROUND_CHECK can run it into scratch instead of val[0].
 void neuralNetwork::roundLayer_cpu_values(i64 layer_id, i64 block_len, F* out,
@@ -1641,7 +1641,7 @@ void neuralNetwork::roundLayer_cpu_values(i64 layer_id, i64 block_len, F* out,
     }
 }
 
-// Host reference arm for roundLayer's gate emission.
+// Host reference path for roundLayer's gate emission.
 void neuralNetwork::roundLayer_cpu_gates(
         std::vector<uniGate> &uni, std::vector<binGate> &bin,
         i64 orgsize, i64 block_len, int c, int m, int M, bool *sparsity_map)
@@ -1686,7 +1686,7 @@ void neuralNetwork::roundLayer(layer &circuit, i64 &layer_id, float scale,bool* 
     int M=max(-m,0);
 
     // Opt-IN, same precedent as fullyConnLayer's witgen_gpu (this file, above):
-    // a new kernel defaults off; --_check runs both arms and asserts field
+    // a new kernel defaults off; --_check runs both paths and asserts field
     // equality. Read per call (not cached), matching witgen_gpu's own reasoning.
     const bool round_gpu   = gkr_config.round_gpu;
     const bool round_check = gkr_config.round_check;
@@ -1732,12 +1732,12 @@ void neuralNetwork::roundLayer(layer &circuit, i64 &layer_id, float scale,bool* 
             }
         }
     } else {
-        releaseFcResident();   // CPU arm reads val[] on the host; drop the VRAM copy
+        releaseFcResident();   // CPU path reads val[] on the host; drop the VRAM copy
         roundLayer_cpu_values(layer_id, block_len, qq_base, c, m, M);
     }
 
     // create() never passes a sparsity map to roundLayer; the kernel assumes the
-    // dense case and the host arm keeps the skip for the general one.
+    // dense case and the host path keeps the skip for the general one.
     if ((gkr_config.witgen_full || gkr_config.witgen_full_check) && !sparsity_map) {
         std::vector<uniGate> ref_u; std::vector<binGate> ref_b;
         if (gkr_config.witgen_full_check)
@@ -1771,7 +1771,7 @@ void neuralNetwork::roundLayer(layer &circuit, i64 &layer_id, float scale,bool* 
 }
 
 
-// Host reference arm for multi_head_matrix_QK's gate emission. The gate list IS
+// Host reference path for multi_head_matrix_QK's gate emission. The gate list IS
 // the QK^T contraction -- the evaluator's CSR reduce performs the dot products.
 void neuralNetwork::multi_head_matrix_QK_cpu_gates(
         std::vector<uniGate> &uni, std::vector<binGate> &bin, i64 score_count)
@@ -1858,9 +1858,9 @@ void neuralNetwork::compute_e_table()
     }
 }
 
-// Host reference arms for softmax_layer_1, kept as the A/B target for the GPU
+// Host reference paths for softmax_layer_1, kept as the A/B target for the GPU
 // kernels. Bodies are the original loops verbatim; the value loop writes into an
-// advice-block-relative buffer (index 0 == val[0][orgsize]) so the check arm can
+// advice-block-relative buffer (index 0 == val[0][orgsize]) so the check path can
 // run it into scratch, and the gate loop appends to caller-supplied lists.
 void neuralNetwork::softmax_layer_1_cpu_values(F *out, i64 layer_id, i64 orgsize,
                                                i64 score_count, int c1, int e1,
@@ -2065,9 +2065,9 @@ void neuralNetwork::softmax_layer_1(layer &circuit, i64 &layer_id,float SQ,float
     layer_id++;
 }
 
-// Host reference arm for softmax_layer_2. Values and gates are interleaved in
+// Host reference path for softmax_layer_2. Values and gates are interleaved in
 // the original loop, so both come from one function; `v0` is the val[0] base the
-// advice writes through, which the check arm points at scratch instead.
+// advice writes through, which the check path points at scratch instead.
 void neuralNetwork::softmax_layer_2_cpu(std::vector<uniGate> &uni,
                                         std::vector<binGate> &bin, F *v0,
                                         i64 layer_id, i64 orgsize, i64 score_count,
@@ -2184,7 +2184,7 @@ void neuralNetwork::softmax_layer_2(layer &circuit, i64 &layer_id,float SQ,float
     layer_id++;
     
 }
-// Host reference arm for softmax_layer_3's gate emission.
+// Host reference path for softmax_layer_3's gate emission.
 void neuralNetwork::softmax_layer_3_cpu_gates(
         std::vector<uniGate> &uni, std::vector<binGate> &bin,
         i64 orgsize, i64 score_count)
@@ -2221,7 +2221,7 @@ void neuralNetwork::softmax_layer_3(layer &circuit, i64 &layer_id,float SQ,float
     circuit.need_phase2 = true;
     circuit.zero_start_id=0;
     // sumE != 0 is a property of softmax_layer_1's advice, checked here in both
-    // arms: the GPU kernel lays out indices and never reads it.
+    // paths: the GPU kernel lays out indices and never reads it.
     for(int head=0;head<HEAD;head++)
         for(int i=0;i<len;i++)
         {
@@ -2255,9 +2255,9 @@ void neuralNetwork::softmax_layer_3(layer &circuit, i64 &layer_id,float SQ,float
     layer_id++;
     q_offset=orgsize+10+HEAD*2*len+4*HEAD*score_count+HEAD*len*HSIZE; 
 }
-// Host reference arm, kept as the A/B target for the GPU kernel. Body is the
+// Host reference path, kept as the A/B target for the GPU kernel. Body is the
 // original triple loop verbatim; only the destination is now a parameter so the
-// GKR_WITGEN_CHECK arm can run it into scratch instead of into val[layer_id].
+// GKR_WITGEN_CHECK path can run it into scratch instead of into val[layer_id].
 void neuralNetwork::fullyConnLayer_cpu(F *out, i64 first_fc_id, i64 x_offset, int x_layer)
 {
     // Rows are independent: row i only ever writes matIdx(i, co, channel_out) for its own
@@ -2507,7 +2507,7 @@ void neuralNetwork::prepareMax(i64 layer_id, i64 idx, i64 max_id) {
     if (data > val[0].at(max_id)) val[0].at(max_id) = data;
 }
 
-// Host reference arm for the gate replay, kept as the A/B target for the GPU
+// Host reference path for the gate replay, kept as the A/B target for the GPU
 // evaluator. Body is the original loop verbatim; only the destination is now a
 // parameter so GKR_GATES_CHECK can run it into scratch instead of val[layer_id].
 // Pre: out has circuit.size elements. Post: out holds the layer's values.
@@ -2592,7 +2592,7 @@ void neuralNetwork::calcNormalLayer(const layer &circuit, i64 layer_id,bool outp
 
     // Opt-IN, same precedent as fullyConnLayer's witgen_gpu and roundLayer's
     // round_gpu (this file): a new kernel defaults off; --gates-check runs both
-    // arms and asserts field equality. Read per call (not cached) so
+    // paths and asserts field equality. Read per call (not cached) so
     // --witgen-chain can flip it between the parent's probe pass and the children.
     const bool gates_gpu   = gkr_config.gates_gpu;
     const bool gates_check = gkr_config.gates_check;

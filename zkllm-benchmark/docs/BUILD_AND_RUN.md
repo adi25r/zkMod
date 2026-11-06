@@ -34,7 +34,7 @@ Upstream recommended CUDA 12.1.0 in conda. Its status with respect to this misco
 
 ### Make targets
 
-`matmul-bm hadamard-bm com-bm tlookup-bm ppgen commit-param partition`, plus `all` and `clean`. `test-prims`, `bench-mul`, `test-blendy` and `test-blendy-diag` are built by hand in `verify_cuda129.sbatch`. `plots/memtrace/build.sh [dir]` builds an allocation-tracing `partition` in a copy; run it with `MEMTRACE_OUT=<prefix>`.
+`matmul-bm hadamard-bm com-bm tlookup-bm ppgen commit-param partition`, plus `all` and `clean`.
 
 ## Python setup
 
@@ -128,7 +128,6 @@ From `getenv` and `os.environ` in the code:
 | `ZKLLM_SQUASH_MAX_LOG` | 24 | Maximum squashed elements, log2 |
 | `ZKLLM_EARLY_CARRY` | off | `1` sets the default of `--early-carry` |
 | `CUDA_VISIBLE_DEVICES` | | Set by the driver per partition from `--devices` |
-| `MEMTRACE_OUT` | `memtrace` | Output prefix of the traced build |
 
 Harness variables: `ZKMOD_PROVER_MODE`, `PIPE_SPLITS`, `WORKDIR_ROOT`, `SKIP_SEQ`, `HF_TOKEN` (`run_experiments.sh`).
 
@@ -137,10 +136,6 @@ Harness variables: `ZKMOD_PROVER_MODE`, `PIPE_SPLITS`, `WORKDIR_ROOT`, `SKIP_SEQ
 | Script | Purpose |
 |--------|---------|
 | `llama-partition.py` | LLaMa-2 counterpart of `opt-partition.py`, with fewer modes |
-| `op-partition.py`, `op-partition-sweep.sh` | K operations per partition, prints `OPS_SUMMARY`; needs a running MPS daemon |
-| `plots/concurrency_4090.sh` | N concurrent one-layer provers on one GPU |
-| `zkattn-bench.py`, `zkmod-pipeline.py` | Estimators from micro-benchmarks, not real proofs |
-| `parse_results.py [dir] [--all]` | `summary.log` and JSON to `<dir>/summary.csv` |
 | `acc/` | Perplexity tests for LLaMa-2 (`acc/download-data.py`, `acc/main.py <7\|13> <seq_len> <nsamples>`) |
 
 ## `run_experiments.sh`
@@ -169,8 +164,6 @@ Run from `zkllm-benchmark/`. All need `CUDA_HOME` pointing at CUDA 12.9 and one 
 |--------|---------|-------------------|---------|
 | `run_e2e.sh [models...]` | zkLLM vs zkMod sweep with square-root commitments. Wraps `run_experiments.sh`. | `results-h100-e2e-<seq>-<id>` | `SEQ_LEN` (2048), `PIPE_SPLITS` (`4 8 12 16`), `ZKMOD_PROVER_MODE` (`op`) |
 | `run_sm_scaling.sh` | Baseline with SMs capped by `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`. A probe records the SM count seen. | `results-sm-scaling-<id>` | `MODELS`, `SEQ_LENS`, `SM_COUNTS`, `REPS` |
-| `run_witgen_first.sh` | Witness-first vs monolith, with a smoke test first and a byte comparison of outputs. Needs host memory of about `ws_peak_gb`; opt-13b at 2048 is a few hundred GB. | `results-witgen-first-<seq>-<id>` | `SMOKE_MODEL`, `MODELS`, `SEQ_LEN`, `REPS`, `COMMITMENTS` |
-| `run_early_carry_ab.sh` | Early carry on vs off, alternating within each repetition, against the monolith. | `results-early-carry-ab-opt-<M>-<seq>-<com>-<id>` | `MODEL`, `SEQ_LEN`, `REPS`, `CONFIGS`, `COMMITMENTS` |
 
 ## `./zkmod` commands
 

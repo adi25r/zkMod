@@ -91,7 +91,7 @@ inline auto reduce_local(const gpu_fe* d_arr, int nb) {
 // Sparse upload (default on; GKR_SC_SPARSE=0 restores the dense copy). The Lasso
 // sources are mostly zero, yet the dense path moves all of them over PCIe per
 // partition, pageable, which degrades badly when many partitions share the GPU (the
-// CPU arm skips zero pairs and never pays it). alloc() scans both arrays ONCE
+// CPU path skips zero pairs and never pays it). alloc() scans both arrays ONCE
 // (threaded) into a per-4096-block CSR of (global index, raw 32-byte value); bring()
 // then uploads only the window's nonzeros and scatters them into a zeroed device
 // window, so the kernels see exactly the bytes the dense copy would have produced.

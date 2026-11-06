@@ -266,7 +266,7 @@ void prover::sumcheckInitPhase1(const F &relu_rou_0)
         if (V_mult[b].size()    < need) V_mult[b].resize(need);
         if (mult_array[b].size() < need) mult_array[b].resize(need);
         if (need) memset(mult_array[b].data(), 0, need * sizeof(linear_poly));
-        // tmp_* are read only at the CPU fold; write-only under the GPU arm.
+        // tmp_* are read only at the CPU fold; write-only under the GPU path.
         if (!gkr_sc_gpu_enabled()) {
             if (tmp_V_mult[b].size()    < need) tmp_V_mult[b].resize(need);
             if (tmp_mult_array[b].size() < need) tmp_mult_array[b].resize(need);
@@ -528,7 +528,7 @@ void prover::sumcheckInitPhase2()
         if (V_mult[b].size()    < need) V_mult[b].resize(need);
         if (mult_array[b].size() < need) mult_array[b].resize(need);
         if (need) memset(mult_array[b].data(), 0, need * sizeof(linear_poly));
-        // tmp_* are read only at the CPU fold; write-only under the GPU arm.
+        // tmp_* are read only at the CPU fold; write-only under the GPU path.
         if (!gkr_sc_gpu_enabled()) {
             if (tmp_V_mult[b].size()    < need) tmp_V_mult[b].resize(need);
             if (tmp_mult_array[b].size() < need) tmp_mult_array[b].resize(need);
@@ -825,7 +825,7 @@ void sumcheckUpdate_worker(quadratic_poly &sum,vector<linear_poly> &tmp_v,vector
 quadratic_poly prover::sumcheckUpdateEach(const F &previous_random, bool idx) 
 {
     // Rounds run on the device once gkr_sc_begin() uploaded the tables; the host
-    // arrays below are then stale by design and only the CPU arm touches them.
+    // arrays below are then stale by design and only the CPU path touches them.
     if (gkr_sc_active_b(idx)) {
         quadratic_poly ret;
         if (total[idx] == 1)
@@ -840,7 +840,7 @@ quadratic_poly prover::sumcheckUpdateEach(const F &previous_random, bool idx)
     auto &tmp_v = V_mult[idx];
     auto &tmp_mult_2 = tmp_mult_array[idx];
     auto &tmp_v_2 = tmp_V_mult[idx];
-    // The init phases size tmp_* only when the GPU arm is off for the whole run; a
+    // The init phases size tmp_* only when the GPU path is off for the whole run; a
     // group gkr_sc_begin could not fit in VRAM lands here with them empty. Grow-only,
     // so later rounds are free.
     if (tmp_v_2.size()    < (total[idx] >> 1)) tmp_v_2.resize(total[idx] >> 1);
@@ -1268,7 +1268,7 @@ void prover::commitOutputPrivate(const vector<G1> &gens,int thr,bool keep_ww) {
         for (int i = 0; i < len; ++i)
             if (!src[i].isZero()) chk[i] = convert(src[i]);
         const bool was_cpu = gkr_config.commit_cpu;
-        gkr_config.commit_cpu = true;                 // force the reference arm
+        gkr_config.commit_cpu = true;                 // force the reference path
         G1 *ref = prover_commit(chk, (G1 *) gens.data(), l, thr);
         gkr_config.commit_cpu = was_cpu;
         const int rownum = 1 << (l / 2);

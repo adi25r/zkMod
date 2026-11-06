@@ -2,7 +2,7 @@
 # zkgptbaselineprofile: latency breakdown (witgen vs prove) of the splits=1 CPU monolith
 # vs host thread count. x = model, series = threads.
 #
-# Runs strictly one at a time: the paper-layout monolith needs ~171 GiB (gpt2) /
+# Runs strictly one at a time: the monolith needs ~171 GiB (gpt2) /
 # ~356 GiB (opt350m) host, and a thread-scaling curve is meaningless if two runs
 # share the cores. opt1b3 is NOT attempted: its monolith needs a 2^33 Lasso domain
 # (~512 GiB of tables) on top of a 2^32-element witness (128 GiB) -- more than the
@@ -19,7 +19,7 @@ unset OMP_NUM_THREADS GKR_BFEVAL_GPU GKR_SC_STREAM_BITS
 declare -A SPEC=( [gpt2]="12 768 3072" [opt350m]="24 1024 4096" )
 MODELS=${MODELS:-"gpt2 opt350m"}
 THREADS=${THREADS:-"192 128 64 32 16"}
-BIN=${BIN:-./bin/main_gkr_split_witgen}
+BIN=${BIN:-./bin/main_gkr_split}
 note(){ echo "[$(date +%m-%d\ %H:%M:%S)] $*"; }
 summ(){ grep -E '^PHASE .*ev=end .*phase=(witgen|prove) ' "$1" | grep -oE 'phase=\w+|dur_s=[0-9.]+' | paste -sd' '; }
 done_log(){ grep -q "All verification passed" "$1" 2>/dev/null; }
@@ -38,7 +38,7 @@ for m in $MODELS; do
   read -r L attn lin <<< "${SPEC[$m]}"
   # CPU witgen + CPU prove at each thread count
   for t in $THREADS; do
-    log="$LOGS/${m}_t${t}_cpu.log"
+    log="$LOGS/${m}_t${t}_mono.log"
     if done_log "$log"; then note "$m t=$t cpu already done -- skip"; continue; fi
     wait_mem "${NEED[$m]}"
     note "=== $m threads=$t cpu witgen ==="

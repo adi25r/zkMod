@@ -5,7 +5,7 @@ struct GkrConfig {
     // c MUST divide range_size: the chunked lookup decomposes a range_size-bit value
     // into range_size/c chunks of c bits, and the CPU baseline enforces
     // `range % chunk_bits == 0` (range_prover.cpp). Legal c for 54: 1,2,3,6,9,18,27,54.
-    // range_size 54 matches the CPU arm's statement; smaller values prove a weaker one.
+    // range_size 54 matches the CPU path's statement; smaller values prove a weaker one.
     int  range_c    = 9;
     int  range_k    = 1;
     int  range_size = 54;
@@ -49,7 +49,7 @@ struct GkrConfig {
     // 1, NOT auto. Auto-splitting LayerNum into P partitions registers P constraints of
     // next_pow2(per_layer * l_p) instead of one of next_pow2(per_layer * LayerNum), and
     // sum(next_pow2) != next_pow2(sum) -- so a VRAM-derived P silently changes the total
-    // padded slot count and breaks parity with the CPU arm's single constraint.
+    // padded slot count and breaks parity with the CPU path's single constraint.
     int   range_partitions = 1;   // --partitions N
     float vram_gb          = 64.0f; // --vram-gb N  (MI210 default)
 
@@ -79,7 +79,7 @@ struct GkrConfig {
     // (whose probe pass calls fullyConnLayer) so the parent reaches fork() with no
     // HIP context, then turn it ON inside each child. See main_gkr_split.cpp.
     bool witgen_gpu    = false;  // env GKR_WITGEN_GPU sets the initial value
-    bool witgen_check  = false;  // env GKR_WITGEN_CHECK: run both arms, assert equal
+    bool witgen_check  = false;  // env GKR_WITGEN_CHECK: run both paths, assert equal
 
     // GPU roundLayer, fused onto a resident fullyConnLayer output (no D2H/H2D at
     // the fc->round boundary). Independent opt-in from witgen_gpu: the GPU path
@@ -87,7 +87,7 @@ struct GkrConfig {
     // is actually resident (see neuralNetwork.cpp); otherwise roundLayer falls
     // back to its CPU body unchanged.
     bool round_gpu     = false;  // env GKR_ROUND_GPU
-    bool round_check   = false;  // env GKR_ROUND_CHECK: run both arms, assert equal
+    bool round_check   = false;  // env GKR_ROUND_CHECK: run both paths, assert equal
 
     // GPU calcNormalLayer: the gate-driven scatter-accumulate that computes EVERY
     // layer's output (neuralNetwork.cpp). Independent of witgen_gpu/round_gpu --
@@ -95,7 +95,7 @@ struct GkrConfig {
     // device. Same runtime-settable discipline as the two above: --witgen-chain
     // must keep it OFF in the parent so the parent reaches fork() HIP-free.
     bool gates_gpu     = false;  // env GKR_GATES_GPU
-    bool gates_check   = false;  // env GKR_GATES_CHECK: run both arms, assert equal
+    bool gates_check   = false;  // env GKR_GATES_CHECK: run both paths, assert equal
 
     // GPU builders: every layer builder's advice values AND gate emission run in
     // kernels, writing straight into the val[0] device mirror. One flag rather

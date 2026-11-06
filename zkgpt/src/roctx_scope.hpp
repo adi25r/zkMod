@@ -9,7 +9,7 @@
 //   ZKGPT_ROCTX_SCOPEF("part%zu", i);
 //
 // Ranges nest, so a per-partition range can enclose per-phase ones. Collect with
-// `rocprofv3 --marker-trace --kernel-trace ...` (see tools/run_profiled.sh).
+// `rocprofv3 --marker-trace --kernel-trace ...`.
 //
 // NB rocprofv3 does not follow fork() without exec(), so these only produce output in
 // the SEQUENTIAL runner. The --concurrent path forks its children, and a profiler

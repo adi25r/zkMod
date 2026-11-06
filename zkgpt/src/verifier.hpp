@@ -34,9 +34,7 @@ public:
     };
 
     // Emits PROVER_BREAKDOWN + PROVER_TOTALS. Call AFTER range_prove(), else the
-    // range-inclusive total is wrong. main_gkr.cpp scopes its verifier inside
-    // if(!only_range) but learns the range time later, so it snapshots the numbers
-    // and calls print_totals() directly -- same output, no lifetime games.
+    // range-inclusive total is wrong.
     static void print_totals(double core, const double* phase, double range_s);
     void report_totals() const { print_totals(prover_time, phase_s, range_prover_time); }
 
@@ -80,7 +78,7 @@ private:
     F uni_value[2];
     F bin_value[3];
     void predicatePhase1(int layer_id);
-    // Host reference arms, kept as the A/B target for the GPU predicate kernels.
+    // Host reference paths, kept as the A/B target for the GPU predicate kernels.
     void predicatePhase1_cpu(int layer_id, F out[2]);
     void predicatePhase2_cpu(int layer_id, F out[3]);
     // Set in betaInitPhase1: initBetaTable zero-fills when beta==0 and early-returns

@@ -28,7 +28,7 @@ The name "Lasso" in this code base means the input-claim reduction above, which 
 | `t` | `--sc-tile-bits`, default -1 | Caps the extension table's future-variable window at `2^t`. Footprint is `2*3^l*2^min(n-l,t)`. `-1` disables tiling. |
 | stream bits | `GKR_SC_STREAM_BITS`, unset | Window for stage-1 source streaming. Unset means dense. Independent of `t`: tiling sizes the extension table and streaming sizes the source. |
 
-**`c` must divide `range_size`, which is 54 in `main_gkr_split`.** `range_prover::push_back` and `range_prover::range_prove` throw `std::invalid_argument` otherwise, and `kChunkBitsCfg` also rejects `c > 30` because the domain is built as `1 << c` in an `int`. The legal values are 1, 2, 3, 6, 9, 18 and 27. Comments that also list 54 (`src/config.hpp`, `tools/sweep_partitions.sh`) are wrong on that value. The comment in the grid loop of `tools/sweep_partitions.sh` that says any `c` is legal with `l = ceil(range/c)` is stale, and the usage example there with `--cs 10,12,13,14,16` will fail at run time for every value.
+**`c` must divide `range_size`, which is 54 in `main_gkr_split`.** `range_prover::push_back` and `range_prover::range_prove` throw `std::invalid_argument` otherwise, and `kChunkBitsCfg` also rejects `c > 30` because the domain is built as `1 << c` in an `int`. The legal values are 1, 2, 3, 6, 9, 18 and 27. The comment in `src/config.hpp` that also lists 54 is wrong on that value.
 
 ## What runs on the GPU
 
@@ -87,7 +87,7 @@ In this repo "serial" describes the relation of witgen to proving: all witgen fi
 
 The carry is the activation window partition i+1 reads as input. `exportSplitBlockCarry` extracts it from partition i's `val[0]`, a window of `len * feature_dim` values. In overlapped mode it passes through a `MAP_SHARED` region (`ChainShm`), with pipe `gates[i]` signalling that it is ready. This makes witgen a strictly serial chain.
 
-`GKR_EARLY_CARRY=1` publishes the carry from the `on_values_ready` hook in `create()`, right after the builder loop, instead of after merge, `initSubset` and input copy. The child re-exports at the end of its build and exits non-zero if the two differ. The figure queues set it for all forked arms. `GKR_EARLY_CARRY` has no effect in controller mode or on the last partition.
+`GKR_EARLY_CARRY=1` publishes the carry from the `on_values_ready` hook in `create()`, right after the builder loop, instead of after merge, `initSubset` and input copy. The child re-exports at the end of its build and exits non-zero if the two differ. The figure queues set it for all partitioned runs. `GKR_EARLY_CARRY` has no effect in controller mode or on the last partition.
 
 Prebuild (`GKR_PREBUILD`, on by default, off whenever the witness cache is enabled) lets child i+1 take a build slot and do everything that does not read the carry, such as layout, weights and the input layer. The `on_before_values` hook then waits for the real carry. Slots go out in chain order through pipes `started[i]`, which avoids deadlock.
 
@@ -139,13 +139,13 @@ Host and VRAM peaks both land in `verify_lasso`. Right after it, in `verifier::p
 
 ## Run modes
 
-Set by `tools/results/speedup_analysis_models/paper_arith/_queue/run_paper_arith.sh` and `run_paper_mono.sh`. Every run sets `ZKGPT_WITNESS_CACHE=0`, and partitioned runs set `GKR_EARLY_CARRY=1`. Log names keep the internal numbers `arm0`, `arm1` and `arm4`.
+Set by `tools/results/figures/queue/run_zkmod.sh` and `run_monolith.sh`. Every run sets `ZKGPT_WITNESS_CACHE=0`, and partitioned runs set `GKR_EARLY_CARRY=1`.
 
 | Mode | Witgen | Prove | Partitions | Flags | Environment |
 |---|---|---|---|---|---|
-| `mono` (`arm0`) | CPU | CPU | 1 | `--c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit` | `GKR_LASSO_CPU GKR_MATMUL_CPU GKR_PRED_CPU GKR_SC_CPU` |
-| `cpu` (`arm1`) | CPU | CPU | default | as `mono`, plus `--overlapped -1` | as `mono` |
-| `gpu` (`arm4`) | GPU | GPU | default | `--overlapped -1 --c 18 --matmul-k 4 --range-k 8 --lasso-k 8 --sc-tile-bits 18` | `GPU_MAX_HW_QUEUES=1 GKR_GPU_PROCS=12 GKR_PIN_CORES=1 GKR_BFEVAL_GPU=1 GKR_SC_STREAM_BITS=22 GKR_WITGEN_GPU GKR_ROUND_GPU` |
+| `mono` | CPU | CPU | 1 | `--c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit` | `GKR_LASSO_CPU GKR_MATMUL_CPU GKR_PRED_CPU GKR_SC_CPU` |
+| `cpu` | CPU | CPU | default | as `mono`, plus `--overlapped -1` | as `mono` |
+| `gpu` | GPU | GPU | default | `--overlapped -1 --c 18 --matmul-k 4 --range-k 8 --lasso-k 8 --sc-tile-bits 18` | `GPU_MAX_HW_QUEUES=1 GKR_GPU_PROCS=12 GKR_PIN_CORES=1 GKR_BFEVAL_GPU=1 GKR_SC_STREAM_BITS=22 GKR_WITGEN_GPU GKR_ROUND_GPU` |
 
 Default partitions are one layer each. `TPC` defaults to `192 / partitions`, and to `192 / 3 = 64` for opt2b7 at its default split.
 
@@ -171,7 +171,7 @@ Default partitions are one layer each. `TPC` defaults to `192 / partitions`, and
 - **Timed GPU regions must sync first.** Kernels launch asynchronously. `range_prover.cpp` calls `gkr_phase_barrier`. `gkr_prover_barrier` in `verifier.cpp` is defined only under `GKR_GPU_ENABLED`, which CMake never sets, so it is a no-op in normal builds and `ph_gkr_matmul`, `ph_gkr_generic` and the Lasso timer can leak kernel time into the next phase.
 - **Do not guard GPU paths on `#ifdef GKR_GPU_ENABLED`.** The path would compile out with no diagnostic.
 - **The Lagrange basis is not counted.** `brute_force_compute_LR` runs before the timed `hyrax::open`, matching the modular-zkp baselines.
-- **Declare regions with `ZKGPT_PHASE_SCOPE`.** It emits a `PHASE` line and a ROCTx range, and `tools/overlay_concurrent.py` joins them by name.
+- **Declare regions with `ZKGPT_PHASE_SCOPE`.** It emits a `PHASE` line and a ROCTx range.
 - **`circuit_s` is not witgen time.** Its timer starts in `create()` and stops at the top of `verifier::prove`. Use `witgen_s`.
 - **`timer::elapse_sec()` is cumulative**, not the last interval. Accumulating it per layer overstates the sum.
 

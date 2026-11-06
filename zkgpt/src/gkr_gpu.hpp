@@ -15,7 +15,7 @@ void gkr_sc_begin(
 
 // Returns true if GPU state is active for group b.
 bool gkr_sc_active_b(int b);
-// True when the GPU sumcheck fold is the active arm (GKR_SC_CPU unset).
+// True when the GPU sumcheck fold is the active path (GKR_SC_CPU unset).
 bool gkr_sc_gpu_enabled();
 void gkr_sc_report();
 

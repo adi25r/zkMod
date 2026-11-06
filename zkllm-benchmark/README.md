@@ -13,7 +13,7 @@ Use the driver from the repository root. See the [top-level README](../README.md
 | `*.cu`, `*.cuh` | Prover sources |
 | `opt-partition.py` | Runs one partitioned proof |
 | `opt-commit.py`, `opt-recommit.py` | Commit model weights |
-| `run_e2e.sh`, `run_sm_scaling.sh`, `run_witgen_first.sh`, `run_early_carry_ab.sh` | Experiment scripts |
+| `run_e2e.sh`, `run_experiments.sh`, `run_sm_scaling.sh` | Experiment scripts |
 | `plots/` | Plot scripts |
 | `docs/` | [Architecture](docs/ARCHITECTURE.md), [build and run reference](docs/BUILD_AND_RUN.md) |
 

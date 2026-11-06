@@ -1153,7 +1153,7 @@ inline void gpu_emit_and_eval(size_t nu, size_t nb, size_t sz,
 }
 
 // roundLayer: 3 bin + 2 uni per element, flat (create() never passes a sparsity
-// map to this builder; the host arm keeps the skip for the general case).
+// map to this builder; the host path keeps the skip for the general case).
 static __global__ void round_gates_kernel(
         DevUniGate* __restrict__ ug, DevBinGate* __restrict__ bg,
         long long orgsize, long long block_len,
@@ -1502,7 +1502,7 @@ static __global__ void sm1_check_gates_kernel(
 // global load it already needs.
 //
 // sqrt(__int128) on the host converts to double and calls sqrt(double); above
-// 2^53 that conversion loses bits, but BOTH arms lose the same bits, so they
+// 2^53 that conversion loses bits, but BOTH paths lose the same bits, so they
 // agree. Same reasoning as GELU 1: reproduce the host's conversion points, do
 // not "improve" them.
 

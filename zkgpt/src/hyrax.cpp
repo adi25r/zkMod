@@ -179,7 +179,7 @@ void brute_force_compute_LR(Fr* L,Fr* R,Fr* r,int l)
         R[k]=lagrange(r+c,halfl,k);
 }
 
-// Reference arm for the GPU port. O(2^l * l).
+// Reference path for the GPU port. O(2^l * l).
 // Split across nthreads with per-thread partial sums (field addition is exact, so the
 // result is identical to the serial loop).
 static Fr bfeval_orig(Fr* w,Fr* r,int l,int nthreads=1)

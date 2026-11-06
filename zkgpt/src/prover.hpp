@@ -132,8 +132,7 @@ public:
     void commitInputSeparate_image(const vector<G1> &gens,int thread_n, timer *T);
     void commitInputSeparate_predicate(const vector<G1> &gens,int thread_n, timer *T);
     // keep_ww=false drops the host __int128 mirror of the committed vector. It is
-    // write-only after the MSM everywhere except OwnedCommitment::capture (used by
-    // main_demo_llm_split / main_demo_llm_cached), so the default keeps it and only
+    // write-only after the MSM everywhere except OwnedCommitment::capture, so the default keeps it and only
     // split_utils.hpp's boundary commit opts out. On the GPU path dropping it also
     // removes the host array entirely -- see gpu_fr_scalars.hpp.
     void commitOutputPrivate(const vector<G1> &gens,int thread_n=1,bool keep_ww=true);
@@ -173,9 +172,8 @@ public:
     // generator vector (ret.g = gens.data()) while commit_values_standalone new[]s
     // its own, so the arrays and the basis are owned independently. Both default to
     // false, which means "never free cc_input" for every assignment site that does
-    // not opt in (notably main_demo_llm_split / main_demo_llm_cached, where cc_input
-    // aliases an OwnedCommitment's vectors and must never be delete[]d, and
-    // main_demo_utils which already frees it by hand).
+    // not opt in (notably where cc_input aliases an OwnedCommitment's vectors and
+    // must never be delete[]d).
     bool cc_input_owned = false;        // owns cc_input.w / .ww / .comm
     bool cc_input_owns_gens = false;    // additionally owns cc_input.g
     bool output_private = false;

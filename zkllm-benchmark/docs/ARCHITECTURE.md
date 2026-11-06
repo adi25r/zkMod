@@ -52,7 +52,7 @@ Upstream built `main`, `ppgen`, `commit-param`, `self-attn`, `ffn`, `rmsnorm`, `
 
 `opt-partition.py` defaults to `--prover-mode layer`. `run_experiments.sh` and the sweep scripts pass `ZKMOD_PROVER_MODE` (default `op`) to the partitioned runs, and always run the monolithic baseline on the layer path. The driver describes the op path as giving the same proofs and boundary commitments in about a quarter of the GPU memory. Witness-first exists only on the layer path, because `partition.cu` rejects `--witgen-first` with `--op-range`.
 
-`--splits` always cuts at layers. `op-partition.py` is a separate driver that partitions at K operations per partition for what one measured sweep showed.
+`--splits` always cuts at layers.
 
 ### Boundary files
 
@@ -78,8 +78,7 @@ Run from the repository root, since these paths are relative and not namespaced 
 | Model layers | `llama-layer.cu`, `opt-layer.cu`, `weight-stream.cu`, `witness-store.cu` | Per-layer statement (`run_opt_layer`), op state (`opt_live_at`), streaming, witness store |
 | Entry point | `partition.cu` | Single process for one partition: `witgen` or `prove` |
 | Upstream per-op programs | `rmsnorm.cu`, `self-attn.cu`, `ffn.cu`, `skip-connection.cu`, `main.cu` | Original LLaMa pipeline, no longer in `TARGETS` |
-| Micro-benchmarks | `tlookup-bm.cu`, `matmul-bm.cu`, `hadamard-bm.cu`, `com-bm.cu`, `bench-mul.cu` | Per-operation timing and multiply throughput |
-| Tests | `test-prims.cu`, `test-blendy.cu`, `test-blendy-diag.cu`, `check_prims.py` | Primitive checks against Python bignums; staged vs legacy sumcheck |
+| Micro-benchmarks | `tlookup-bm.cu`, `matmul-bm.cu`, `hadamard-bm.cu`, `com-bm.cu` | Per-operation timing and multiply throughput |
 | Timer | `timer.cpp`, `timer.hpp` | Wall-clock timer used by all targets |
 | Compatibility | `zkml_nvcc_compat.hpp` | Force-included when the other prover is built with nvcc. Not used by zkLLM. |
 

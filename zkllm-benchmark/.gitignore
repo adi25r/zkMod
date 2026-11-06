@@ -12,8 +12,6 @@
 !CMakeLists.txt
 !README.md
 !acc/0
-!plots/*.png
-!plots/data/*.csv
 results-*/
 zkllm-workdir*/
 model-storage/
