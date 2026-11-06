@@ -9,10 +9,10 @@ void seed_rng(uint64_t seed) {
 
 FieldElement get_random_element() {
     static std::uniform_int_distribution<uint64_t> dist64(0, std::numeric_limits<uint64_t>::max());
-    uint64_t limbs[4] = { dist64(g_rng), dist64(g_rng), dist64(g_rng), dist64(g_rng) };
+    uint64_t limbs[4] = {dist64(g_rng), dist64(g_rng), dist64(g_rng), dist64(g_rng)};
 
     FieldElement res;
-    res.setArrayMask(limbs, sizeof(limbs)); // reduces mod r internally
+    res.setArrayMask(limbs, sizeof(limbs));  // reduces mod r internally
     return res;
 }
 // langrange coefficients

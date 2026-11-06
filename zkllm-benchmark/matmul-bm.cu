@@ -9,31 +9,31 @@
 
 using namespace std;
 
-KERNEL void e_step_kernel(GLOBAL Fr_t* arr_in, GLOBAL Fr_t* arr_out, Fr_t u, uint n_in)
-{
+KERNEL void e_step_kernel(GLOBAL Fr_t* arr_in, GLOBAL Fr_t* arr_out, Fr_t u, uint n_in) {
     const uint gid = GET_GLOBAL_ID();
-    if (gid >= n_in) return;
+    if (gid >= n_in)
+        return;
 
     uint gid0 = 2 * gid;
     uint gid1 = 2 * gid + 1;
 
     u = blstrs__scalar__Scalar_mont(u);
-    arr_out[gid1] = blstrs__scalar__Scalar_mul(arr_in[gid], u); // u * arr_in[gid]
-    arr_out[gid0] = blstrs__scalar__Scalar_sub(arr_in[gid], arr_out[gid1]); // (1 - u) * arr[gid]
+    arr_out[gid1] = blstrs__scalar__Scalar_mul(arr_in[gid], u);              // u * arr_in[gid]
+    arr_out[gid0] = blstrs__scalar__Scalar_sub(arr_in[gid], arr_out[gid1]);  // (1 - u) * arr[gid]
 }
 
-FrTensor e_step(const FrTensor& arr_in, const Fr_t& u)
-{
+FrTensor e_step(const FrTensor& arr_in, const Fr_t& u) {
     auto n_in = arr_in.size;
     FrTensor arr_out(2 * arr_in.size);
-    e_step_kernel<<<(n_in+FrNumThread-1)/FrNumThread,FrNumThread>>>(arr_in.gpu_data, arr_out.gpu_data, u, n_in);
+    e_step_kernel<<<(n_in + FrNumThread - 1) / FrNumThread, FrNumThread>>>(arr_in.gpu_data, arr_out.gpu_data,
+                                                                           u, n_in);
     cudaDeviceSynchronize();
     return arr_out;
 }
 
-FrTensor e(const FrTensor& arr_in, const vector<Fr_t> us)
-{
-    if (us.empty()) return arr_in;
+FrTensor e(const FrTensor& arr_in, const vector<Fr_t> us) {
+    if (us.empty())
+        return arr_in;
 
     else {
         FrTensor arr_out = e_step(arr_in, us.back());
@@ -41,18 +41,16 @@ FrTensor e(const FrTensor& arr_in, const vector<Fr_t> us)
     }
 }
 
-FrTensor e(const vector<Fr_t> us)
-{
+FrTensor e(const vector<Fr_t> us) {
     Fr_t one = {1, 0, 0, 0, 0, 0, 0, 0};
-    FrTensor arr_in (1, &one);
+    FrTensor arr_in(1, &one);
     return e(arr_in, us);
 }
 
 Fr_t one = {1, 0, 0, 0, 0, 0, 0, 0};
 Fr_t zero = {0, 0, 0, 0, 0, 0, 0, 0};
 
-int main(int argc, char *argv[])
-{   
+int main(int argc, char* argv[]) {
     string prefix_left = argv[1];
     string prefix_right = argv[2];
     uint num = stoi(argv[3]);
@@ -69,14 +67,12 @@ int main(int argc, char *argv[])
     auto u1 = random_vec(ceilLog2(dim1));
     auto u2 = random_vec(ceilLog2(dim2));
 
-    for (uint i = 0; i < num; ++ i)
-    {
-        auto matl = FrTensor::from_int_bin(prefix_left + to_string(i)+".bin");
-        auto matr = FrTensor::from_int_bin(prefix_right + to_string(i)+".bin");
+    for (uint i = 0; i < num; ++i) {
+        auto matl = FrTensor::from_int_bin(prefix_left + to_string(i) + ".bin");
+        auto matr = FrTensor::from_int_bin(prefix_right + to_string(i) + ".bin");
         auto matres = FrTensor::matmul(matl, matr, dim0, dim1, dim2);
 
-        if (matl.size != dim0 * dim1 || matr.size != dim1 * dim2 || matres.size != dim0 * dim2)
-        {
+        if (matl.size != dim0 * dim1 || matr.size != dim1 * dim2 || matres.size != dim0 * dim2) {
             cerr << "Matrix size error!" << endl;
             return 1;
         }
@@ -90,7 +86,7 @@ int main(int argc, char *argv[])
 
     auto L = catTensors(lslices);
     auto R = catTensors(rslices);
-    FrTensor Res(ress.size(), & ress.front()); 
+    FrTensor Res(ress.size(), &ress.front());
 
     auto unum = random_vec(ceilLog2(num));
     auto vnum = random_vec(ceilLog2(num));

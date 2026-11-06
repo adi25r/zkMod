@@ -4,14 +4,14 @@
 #include <cstddef>
 #include <cuda_runtime.h>
 #include "bls12-381.cuh"  // adjust this to point to the blstrs header file
-#include "fr-tensor.cuh" 
+#include "fr-tensor.cuh"
 #include "tlookup.cuh"
 #include "proof.cuh"
 
 class zkReLU {
 public:
     uint scaling_factor;
-    tLookupRange tl_rem; // table for remainder
+    tLookupRange tl_rem;  // table for remainder
     FrTensor decomp(const FrTensor& X, FrTensor& sign, FrTensor& abs, FrTensor& rem);
     FrTensor *sign_tensor_ptr, *abs_tensor_ptr, *rem_tensor_ptr, *m_tensor_ptr;
 
@@ -20,10 +20,5 @@ public:
     void prove(const FrTensor& Z, const FrTensor& A);
     ~zkReLU();
 };
-
-
-
-
-
 
 #endif  // ZKRELU_CUH

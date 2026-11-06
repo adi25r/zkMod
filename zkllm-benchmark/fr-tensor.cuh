@@ -3,7 +3,7 @@
 
 #include <iostream>
 #include <iomanip>
-#include <utility>      // std::pair, std::make_pair
+#include <utility>  // std::pair, std::make_pair
 #include <vector>
 #include <curand_kernel.h>
 #include <random>
@@ -17,16 +17,15 @@ typedef blstrs__g1__G1Affine_affine G1Affine_t;
 typedef blstrs__g1__G1Affine_jacobian G1Jacobian_t;
 
 const uint FrNumThread = 256;
-const uint FrSharedMemorySize = 2 * sizeof(Fr_t) * FrNumThread; 
+const uint FrSharedMemorySize = 2 * sizeof(Fr_t) * FrNumThread;
 
 ostream& operator<<(ostream& os, const Fr_t& x);
 
 vector<Fr_t> random_vec(uint len);
 uint ceilLog2(uint num);
 
-template<typename T>
+template <typename T>
 std::vector<T> concatenate(const std::vector<std::vector<T>>& vecs);
-
 
 KERNEL void Fr_elementwise_add(GLOBAL Fr_t* arr1, GLOBAL Fr_t* arr2, GLOBAL Fr_t* arr_out, uint n);
 
@@ -46,16 +45,13 @@ KERNEL void Fr_elementwise_mont_mul(GLOBAL Fr_t* arr1, GLOBAL Fr_t* arr2, GLOBAL
 
 KERNEL void Fr_broadcast_mont_mul(GLOBAL Fr_t* arr, Fr_t x, GLOBAL Fr_t* arr_out, uint n);
 
-
-
 // define the class FrTensor
 
-class FrTensor
-{   
-    public:
+class FrTensor {
+public:
     Fr_t* gpu_data;
     const uint size;
-    
+
     FrTensor(uint size);
 
     FrTensor(uint size, const Fr_t* cpu_data);
@@ -93,7 +89,7 @@ class FrTensor
     FrTensor operator+(const Fr_t& x) const;
 
     FrTensor& operator+=(const FrTensor& t);
-    
+
     FrTensor& operator+=(const Fr_t& x);
 
     FrTensor operator-() const;
@@ -103,7 +99,7 @@ class FrTensor
     FrTensor operator-(const Fr_t& x) const;
 
     FrTensor& operator-=(const FrTensor& t);
-    
+
     FrTensor& operator-=(const Fr_t& x);
 
     FrTensor& mont();
@@ -115,7 +111,7 @@ class FrTensor
     FrTensor operator*(const Fr_t& x) const;
 
     FrTensor& operator*=(const FrTensor& t);
-    
+
     FrTensor& operator*=(const Fr_t& x);
 
     FrTensor& operator=(const FrTensor& x);
@@ -126,7 +122,6 @@ class FrTensor
 
     std::pair<FrTensor, FrTensor> split(uint window_size) const;
 
-    // TODO: deprecate this
     FrTensor partial_me(const vector<Fr_t>& u, uint window_size) const;
 
     FrTensor partial_me(const vector<Fr_t>& u, uint cur_dim, uint window_size) const;
@@ -136,8 +131,8 @@ class FrTensor
     FrTensor pad(const vector<uint>& shape, const Fr_t& pad_val = {0, 0, 0, 0, 0, 0, 0, 0}) const;
 
     FrTensor transpose(uint M, uint N) const;
-    
-    // moved from rotary embedding part to the wheel. This may be used in future applications of the wheel!
+
+    // moved from rotary embedding part to the wheel
     FrTensor trunc(uint begin_idx, uint end_idx) const;
 
     static FrTensor matmul(const FrTensor& x, const FrTensor& y, uint M, uint N, uint P);
@@ -145,31 +140,35 @@ class FrTensor
     static FrTensor random_int(uint size, uint num_bits);
     static FrTensor random(uint size);
 
-    friend Fr_t Fr_me(const FrTensor& t, vector<Fr_t>::const_iterator begin, vector<Fr_t>::const_iterator end);
+    friend Fr_t Fr_me(const FrTensor& t, vector<Fr_t>::const_iterator begin,
+                      vector<Fr_t>::const_iterator end);
 
-    friend FrTensor Fr_partial_me(const FrTensor& t, vector<Fr_t>::const_iterator begin, vector<Fr_t>::const_iterator end, uint window_size);
+    friend FrTensor Fr_partial_me(const FrTensor& t, vector<Fr_t>::const_iterator begin,
+                                  vector<Fr_t>::const_iterator end, uint window_size);
 
-    friend void Fr_ip_sc(const FrTensor& a, const FrTensor& b, vector<Fr_t>::const_iterator begin, vector<Fr_t>::const_iterator end, vector<Fr_t>& proof);
-    friend void Fr_hp_sc(const FrTensor& a, const FrTensor& b, vector<Fr_t>::const_iterator u_begin, vector<Fr_t>::const_iterator u_end, vector<Fr_t>::const_iterator v_begin, vector<Fr_t>::const_iterator v_end, vector<Fr_t>& proof);
-    friend void Fr_bin_sc(const FrTensor& a, vector<Fr_t>::const_iterator u_begin, vector<Fr_t>::const_iterator u_end, vector<Fr_t>::const_iterator v_begin, vector<Fr_t>::const_iterator v_end, vector<Fr_t>& proof);
-
+    friend void Fr_ip_sc(const FrTensor& a, const FrTensor& b, vector<Fr_t>::const_iterator begin,
+                         vector<Fr_t>::const_iterator end, vector<Fr_t>& proof);
+    friend void Fr_hp_sc(const FrTensor& a, const FrTensor& b, vector<Fr_t>::const_iterator u_begin,
+                         vector<Fr_t>::const_iterator u_end, vector<Fr_t>::const_iterator v_begin,
+                         vector<Fr_t>::const_iterator v_end, vector<Fr_t>& proof);
+    friend void Fr_bin_sc(const FrTensor& a, vector<Fr_t>::const_iterator u_begin,
+                          vector<Fr_t>::const_iterator u_end, vector<Fr_t>::const_iterator v_begin,
+                          vector<Fr_t>::const_iterator v_end, vector<Fr_t>& proof);
 };
 
-KERNEL void Fr_sum_reduction(GLOBAL Fr_t *arr, GLOBAL Fr_t *output, uint n);
-
+KERNEL void Fr_sum_reduction(GLOBAL Fr_t* arr, GLOBAL Fr_t* output, uint n);
 
 KERNEL void random_int_kernel(Fr_t* gpu_data, uint num_bits, uint n, unsigned long seed);
 
-
 KERNEL void random_kernel(Fr_t* gpu_data, uint n, unsigned long seed);
 
+KERNEL void Fr_split_by_window(GLOBAL Fr_t* arr_in, GLOBAL Fr_t* arr0, GLOBAL Fr_t* arr1, uint in_size,
+                               uint out_size, uint window_size);
 
+KERNEL void Fr_me_step(GLOBAL Fr_t* arr_in, GLOBAL Fr_t* arr_out, Fr_t x, uint in_size, uint out_size);
 
-KERNEL void Fr_split_by_window(GLOBAL Fr_t *arr_in, GLOBAL Fr_t *arr0, GLOBAL Fr_t *arr1, uint in_size, uint out_size, uint window_size);
-
-KERNEL void Fr_me_step(GLOBAL Fr_t *arr_in, GLOBAL Fr_t *arr_out, Fr_t x, uint in_size, uint out_size);
-
-KERNEL void Fr_partial_me_step(GLOBAL Fr_t *arr_in, GLOBAL Fr_t *arr_out, Fr_t x, uint in_size, uint out_size, uint window_size);
+KERNEL void Fr_partial_me_step(GLOBAL Fr_t* arr_in, GLOBAL Fr_t* arr_out, Fr_t x, uint in_size, uint out_size,
+                               uint window_size);
 
 DEVICE Fr_t modular_inverse(Fr_t x);
 
@@ -211,11 +210,11 @@ KERNEL void scalar_to_long_kernel(const Fr_t* scalar_ptr, long* long_ptr, uint n
 
 KERNEL void float_to_scalar_kernel(float* float_ptr, Fr_t* scalar_ptr, unsigned long scaling_factor, uint n);
 
-KERNEL void double_to_scalar_kernel(double* double_ptr, Fr_t* scalar_ptr, unsigned long scaling_factor, uint n);
+KERNEL void double_to_scalar_kernel(double* double_ptr, Fr_t* scalar_ptr, unsigned long scaling_factor,
+                                    uint n);
 
 KERNEL void matrixMultiplyOptimized(Fr_t* A, Fr_t* B, Fr_t* C, int rowsA, int colsA, int colsB);
 
 FrTensor catTensors(const vector<FrTensor>& vec);
-
 
 #endif

@@ -9,4 +9,4 @@ typedef long long i64;
 typedef int i32;
 typedef char i8;
 typedef __int128 ll;
-#endif //HYRAX_P224_TYPEDEF_HPP
+#endif  // HYRAX_P224_TYPEDEF_HPP

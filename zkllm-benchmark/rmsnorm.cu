@@ -6,8 +6,7 @@
 #include "rescaling.cuh"
 #include <string>
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char* argv[]) {
     string which = argv[1];
     string input_file_name = argv[2];
     uint seq_len = std::stoi(argv[3]);
@@ -19,9 +18,7 @@ int main(int argc, char *argv[])
     auto rmsnorm_weight = create_weight(
         workdir + "/" + which + "_layernorm.weight-pp.bin",
         workdir + "/" + layer_prefix + "-" + which + "_layernorm.weight-int.bin",
-        workdir + "/" + layer_prefix + "-" + which + "_layernorm.weight-commitment.bin",
-        1, embed_dim
-    );
+        workdir + "/" + layer_prefix + "-" + which + "_layernorm.weight-commitment.bin", 1, embed_dim);
 
     FrTensor X = FrTensor::from_int_bin(input_file_name);
     FrTensor rms_inv_temp = FrTensor::from_int_bin("rms_inv_temp.bin");
@@ -47,5 +44,4 @@ int main(int argc, char *argv[])
     rs1.prove(g_inv_rms, g_inv_rms_);
     verifyWeightClaim(rmsnorm_weight, g.prove(rms_inv_temp, g_inv_rms)[0]);
     return 0;
-    
 }

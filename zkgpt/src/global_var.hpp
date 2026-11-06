@@ -1,6 +1,4 @@
-//
-// Created by 69029 on 5/4/2021.
-//
+// Created by 69029 on 5/4/2021
 
 #include <bits/stdc++.h>
 
@@ -29,15 +27,15 @@ using namespace mcl::bn;
 
 using std::cerr;
 using std::endl;
-using std::vector;
-using std::string;
+using std::ifstream;
+using std::make_pair;
 using std::max;
 using std::min;
-using std::ifstream;
 using std::ofstream;
 using std::ostream;
 using std::pair;
-using std::make_pair;
+using std::string;
+using std::vector;
 
 extern vector<string> output_tb;
 typedef Fr F;
@@ -56,4 +54,4 @@ string to_string_wp(const T a_value, const int n = 4) {
     return out.str();
 }
 
-#endif 
+#endif

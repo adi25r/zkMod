@@ -5,29 +5,26 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
-#include <thread>         // std::thread
+#include <thread>  // std::thread
 #include <mcl/bn.hpp>
 #include "timer.hpp"
 #include "typedef.hpp"
 using namespace std;
 using namespace mcl::bn;
-struct Pack 
-{
+struct Pack {
     G1 gamma;
     Fr a;
     G1 g;
     Fr y;
     Fr x;
-    Pack(G1 gamm,Fr fa, G1 gg,Fr xx,Fr yy)
-    {
-        gamma=gamm;
-        a=fa;
-        g=gg;
-        x=xx;
-        y=yy;
+    Pack(G1 gamm, Fr fa, G1 gg, Fr xx, Fr yy) {
+        gamma = gamm;
+        a = fa;
+        g = gg;
+        x = xx;
+        y = yy;
     }
 };
-
 
 template <typename T>
 class ThreadSafeQueue {
@@ -66,10 +63,9 @@ public:
         lock_guard<mutex> lock(mutex_);
         return queue_.size();
     }
-    void Clear()  
-    {
+    void Clear() {
         lock_guard<mutex> lock(mutex_);
-        queue_={};
+        queue_ = {};
     }
 
 private:

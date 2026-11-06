@@ -3,9 +3,9 @@
 #include "phase_acct.hpp"
 #include <memory>
 #include <vector>
-#include <map>              // probe memoisation, keyed on split_depth
+#include <map>  // probe memoisation, keyed on split_depth
 #include <set>
-#include <functional>              // --unique-parts role dedup
+#include <functional>  // unique-parts role dedup
 #include <string>
 #include <cctype>
 #include <algorithm>
@@ -15,17 +15,17 @@
 
 #include <array>
 #include <cerrno>
-#include <fstream>          // GKR_PIN_CORES: /sys topology
-#include <omp.h>            // omp_set_num_threads: a child's share of the thread pool
-#include <sched.h>          // sched_setaffinity, cpu_set_t
+#include <fstream>  // GKR_PIN_CORES: /sys topology
+#include <omp.h>    // omp_set_num_threads: a child's share of the thread pool
+#include <sched.h>  // sched_setaffinity, cpu_set_t
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
-#include <poll.h>           // mem-gated release loop: wake on a child event
-#include <fcntl.h>         // O_NONBLOCK on the mem-gated stat pipe
+#include <poll.h>   // mem-gated release loop: wake on a child event
+#include <fcntl.h>  // O_NONBLOCK on the mem-gated stat pipe
 #include <unistd.h>
-#include <dirent.h>        // GKR_WITGEN_DEVICE: handoff-file cleanup
+#include <dirent.h>  // GKR_WITGEN_DEVICE: handoff-file cleanup
 #include <sys/stat.h>
 
 #include "circuit.h"
@@ -38,41 +38,36 @@
 #include "range_prover.hpp"
 #include "timer.hpp"
 #include "split_utils.hpp"
-#include "boundary_link.hpp"     // zkMod: bind partition i+1's input to i's committed window
+#include "boundary_link.hpp"  // zkMod: bind partition i+1's input to i's committed window
 #include "gpu_sampler.hpp"
 #include "roctx_scope.hpp"
 #include "phase_log.hpp"
 #include "utils.hpp"
 #include "config.hpp"
 #include "profile_util.hpp"
-#include "gpu_uvm_alloc.hpp"   // per-partition device VRAM high-water tracking
-#include "g1_msm.hpp"          // g1_msm_xfer_h2d_bytes/reset: zkmod-gpu's own H2D counter
-#include "gpu_matmul_prover.hpp"   // MatmulPhaseTimers (GKR_MM_PROF)
-#include "gpu_deg3_sumcheck.hpp"   // Deg3Timer (GKR_MM_PROF)
+#include "gpu_uvm_alloc.hpp"      // per-partition device VRAM high-water tracking
+#include "g1_msm.hpp"             // g1_msm_xfer_h2d_bytes/reset: zkmod-gpu's own H2D counter
+#include "gpu_matmul_prover.hpp"  // MatmulPhaseTimers (GKR_MM_PROF)
+#include "gpu_deg3_sumcheck.hpp"  // Deg3Timer (GKR_MM_PROF)
 #include "witgen_timing.hpp"
-// phase_log.hpp's GKR_PHASE_XFER hook: cumulative H2D of this process, both counters.
+// phase_log.hpp's GKR_PHASE_XFER hook: cumulative H2D of this process, both counters
 extern "C" double zkgpt_phase_h2d_gib() {
     return zkgpt_gpu::gkr_xfer_h2d_gib() + (double)g1_msm_xfer_h2d_bytes() / (1024.0 * 1024.0 * 1024.0);
 }
-#include "witness_cache.hpp"       // GKR_WITGEN_DEVICE: load-hit check
-#include <malloc.h>                // GKR_MEMACCT: mallinfo2
-#include "alloc_trace.hpp"         // GKR_ALLOCTRACE: name the leaked allocation
+#include "witness_cache.hpp"  // GKR_WITGEN_DEVICE: load-hit check
+#include <malloc.h>           // GKR_MEMACCT: mallinfo2
+#include "alloc_trace.hpp"    // GKR_ALLOCTRACE: name the leaked allocation
 
-// GKR_MEMACCT: per-partition memory accounting. mallinfo2().uordblks + .hblkhd is
-// LIVE bytes; climbing per partition = real leak, flat while RSS climbs = allocator
-// retention.
-
-static void memacct(const char *tag, long long idx) {
-    if (!getenv("GKR_MEMACCT")) return;
+static void memacct(const char* tag, long long idx) {
+    if (!getenv("GKR_MEMACCT"))
+        return;
     struct mallinfo2 mi = mallinfo2();
     const double G = 1073741824.0;
     fprintf(stderr,
             "[memacct] %s idx=%lld live_gib=%.2f uordblks_gib=%.2f hblkhd_gib=%.2f "
             "rss_gib=%.2f hwm_gib=%.2f\n",
-            tag, idx,
-            (mi.uordblks + mi.hblkhd) / G, mi.uordblks / G, mi.hblkhd / G,
-            prof_status_kb("VmRSS:") / 1048576.0,
-            prof_status_kb("VmHWM:") / 1048576.0);
+            tag, idx, (mi.uordblks + mi.hblkhd) / G, mi.uordblks / G, mi.hblkhd / G,
+            prof_status_kb("VmRSS:") / 1048576.0, prof_status_kb("VmHWM:") / 1048576.0);
     fflush(stderr);
     alloctrace::report(tag, idx);
 }
@@ -80,212 +75,177 @@ static void memacct(const char *tag, long long idx) {
 using namespace mcl::bn;
 using namespace std;
 
-// Arithmetization: modular-zkp's, exactly, on every partition AND the splits=1
-// monolith -- LLMSplitBlock (no sequence kernel, so no per-layer K/V anchors and no
-// prompt commit), the probe + 2*pow2(input+aux) half/half witness layout with the
-// weights at the midpoint, merge_layer on, and the merged range-query set. Only this
-// runner's machinery (forked --overlapped partitions, concurrent witgen, GPU
-// witgen/prover gates) is ours. The switchable
-// sequence kernel (GKR_ARITH / GKR_MERGE / GKR_SPLIT_MINIMAL_LAYOUT / --chunk-width /
-// --corrupt-kv-* / --prompt-nonzero) no longer exists.
-// merge=1 for the builder AND range_prover's `merged` arg: the two must agree or the
-// range set covers a different circuit than the one proved.
 static constexpr int kMerge = 1;
 
-// Parse a comma-separated list of ints, e.g. "2,5,5" -> {2,5,5} (whitespace ok).
-static std::vector<int> parse_int_csv(const std::string &s) {
+// Parse a comma-separated list of ints, e.g. "2,5,5" -> {2,5,5} (whitespace ok)
+static std::vector<int> parse_int_csv(const std::string& s) {
     std::vector<int> out;
     std::string cur;
     for (char ch : s) {
-        if (ch == ',') { if (!cur.empty()) out.push_back(atoi(cur.c_str())); cur.clear(); }
-        else if (!std::isspace(static_cast<unsigned char>(ch))) cur.push_back(ch);
+        if (ch == ',') {
+            if (!cur.empty())
+                out.push_back(atoi(cur.c_str()));
+            cur.clear();
+        } else if (!std::isspace(static_cast<unsigned char>(ch)))
+            cur.push_back(ch);
     }
-    if (!cur.empty()) out.push_back(atoi(cur.c_str()));
+    if (!cur.empty())
+        out.push_back(atoi(cur.c_str()));
     return out;
 }
 
-// Per-partition knob lookup: empty -> keep default; size 1 -> broadcast; else
-// index i, clamping to the last element if the vector is shorter than #parts.
-static int pick_part(const std::vector<int> &v, int def, std::size_t i) {
-    if (v.empty()) return def;
+// Per-partition knob lookup: empty -> keep default
+static int pick_part(const std::vector<int>& v, int def, std::size_t i) {
+    if (v.empty())
+        return def;
     return v[i < v.size() ? i : v.size() - 1];
 }
 
-// Loop-invariant config plus the per-partition knob vectors, so the sequential loop,
-// the --concurrent prep pass and the re-exec'd children all read one description.
+// Loop-invariant config plus the per-partition knob vectors
 struct SplitCfg {
     std::vector<int> split_depths;
-    std::vector<long long> tiws;      // total_input_witness_sizes
-    std::vector<u64>  scs;            // shared_commit_sizes
+    std::vector<long long> tiws;  // total_input_witness_sizes
+    std::vector<u64> scs;         // shared_commit_sizes
     int embed_size = 0, lin_dim = 0, len = 0, num_threads = 32;
     std::vector<int> part_cs, part_mks, part_rks, part_lls, part_lks;
-    // Knob defaults snapshotted before any partition mutates gkr_config.
+    // Knob defaults snapshotted before any partition mutates gkr_config
     int def_c = 0, def_mk = 0, def_rk = 0, def_ll = 0, def_lk = 0;
-    // `len` is the CIRCUIT sequence width: next_pow2 of the --len argument (the
-    // block takes it as its len, the range prover as its seq_len). Both paths must use
-    // the same value or they size different circuits.
-    std::string vram_csv;        // --vram-csv: device-wide sampler output
-    // 1 ms: witgen's GPU duty is tens of ms of kernel spread over seconds, so a
-    // coarser poll rarely lands on a live kernel and reports ~0%.
-    double vram_interval = 0.001;  // --vram-interval seconds
-    bool witgen_only = false;   // --witgen-only : build (+cache) every partition, skip
-                                // proving. Pairs with a later cache-warm normal run.
+    // `len` is the CIRCUIT sequence width
+    std::string vram_csv;          // vram-csv: device-wide sampler output
+    double vram_interval = 0.001;  // vram-interval seconds
+    bool witgen_only = false;      // witgen-only : build (+cache) every partition, skip
+                                   // proving
     std::size_t nparts() const { return split_depths.size(); }
 };
 
-// Reports the device-wide peak over [t0,t1] and the CSV to query for anything finer.
-// Only cards that actually moved are printed, so an 8-GPU box does not emit 8 idle
-// rows per run.
-static void report_vram_peak(const SplitCfg &cfg, double t0_us, double t1_us,
-                             const char *tag) {
-    if (cfg.vram_csv.empty()) return;
+// Reports the device-wide peak over [t0,t1] and the CSV to query for anything finer
+static void report_vram_peak(const SplitCfg& cfg, double t0_us, double t1_us, const char* tag) {
+    if (cfg.vram_csv.empty())
+        return;
     auto st = zkgpt_sampler::peak_in_window(cfg.vram_csv, t0_us, t1_us);
     unsigned long long busiest = 0;
-    for (const auto &kv : st) busiest = std::max(busiest, kv.second.vram_peak_b);
-    for (const auto &kv : st) {
-        if (kv.second.vram_peak_b < (1ULL << 30)) continue;   // idle card: <1 GiB
-        std::cout << "GPU_SAMPLE phase=" << tag
-                  << " pci=" << kv.first
+    for (const auto& kv : st)
+        busiest = std::max(busiest, kv.second.vram_peak_b);
+    for (const auto& kv : st) {
+        if (kv.second.vram_peak_b < (1ULL << 30))
+            continue;  // idle card: <1 GiB
+        std::cout << "GPU_SAMPLE phase=" << tag << " pci=" << kv.first
                   << " vram_peak_mib=" << kv.second.vram_peak_b / 1048576.0
-                  << " gpu_busy_max=" << kv.second.busy_max
-                  << " gpu_busy_mean=" << kv.second.busy_mean()
+                  << " gpu_busy_max=" << kv.second.busy_max << " gpu_busy_mean=" << kv.second.busy_mean()
                   << " samples=" << kv.second.samples << std::endl;
     }
-    std::cout << "GPU_SAMPLE_MAX phase=" << tag
-              << " vram_peak_mib=" << busiest / 1048576.0
+    std::cout << "GPU_SAMPLE_MAX phase=" << tag << " vram_peak_mib=" << busiest / 1048576.0
               << " csv=" << cfg.vram_csv << std::endl;
 }
 
-static void apply_part_knobs(const SplitCfg &cfg, std::size_t i) {
-    gkr_config.range_c  = pick_part(cfg.part_cs,  cfg.def_c,  i);
+static void apply_part_knobs(const SplitCfg& cfg, std::size_t i) {
+    gkr_config.range_c = pick_part(cfg.part_cs, cfg.def_c, i);
     gkr_config.matmul_k = pick_part(cfg.part_mks, cfg.def_mk, i);
-    gkr_config.range_k  = pick_part(cfg.part_rks, cfg.def_rk, i);
-    gkr_config.lasso_l  = pick_part(cfg.part_lls, cfg.def_ll, i);
-    gkr_config.lasso_k  = pick_part(cfg.part_lks, cfg.def_lk, i);
+    gkr_config.range_k = pick_part(cfg.part_rks, cfg.def_rk, i);
+    gkr_config.lasso_l = pick_part(cfg.part_lls, cfg.def_ll, i);
+    gkr_config.lasso_k = pick_part(cfg.part_lks, cfg.def_lk, i);
 }
 
 struct PartResult {
     double standalone_commit = 0, prover_core = 0, output_commit = 0, verifier = 0, proof_kb = 0;
 };
 
-// A partition split at the same seam the upstream runner splits at: everything up to
-// and including create() is the "build the instance" phase; everything
-// after is the per-job body.
 struct PartitionState {
     std::unique_ptr<prover> p;
     std::unique_ptr<neuralNetwork> net;
     timer circuit_timer;
-    // Real witness-generation wall time. circuit_timer does NOT measure this:
-    // it is stopped at the top of verifier::prove(), so circuit_s spans the
-    // build AND most of the prove phase. See witgen_timing.hpp.
+    // Real witness-generation wall time. circuit_timer does NOT measure this
     double build_s = 0;
-    double fc_s    = 0;
+    double fc_s = 0;
     double gates_s = 0;
 
-    // Witgen-phase peaks, sampled at the build/prove seam in build_partition().
+    // Witgen-phase peaks, sampled at the build/prove seam in build_partition()
     double witgen_gpu_peak_mib = 0;
     double witgen_host_peak_mib = 0;
     double witgen_resident_mib = 0;
     double witgen_h2d_gib = 0;
     double witgen_d2h_gib = 0;
 
-    // create()'s boundary timers, copied out at the build/prove seam, plus the
-    // output-layer padding done after create(). Feed the TIMING_SPLIT line.
+    // create()'s boundary timers
     zkgpt_witgen::Accum wg;
     double pad_s = 0;
-    // Elements of the carry this partition was built from (0 for partition 0) --
-    // the window the boundary link checks against the predecessor's.
+    // Elements of the carry this partition was built from (0 for partition 0)
     long long carry_n = 0;
 };
 
-// GKR_TAMPER_CARRY=<i>: perturb the carry partition i is built from (test hook for
-// the boundary link; an unlinked run would still ACCEPT every partition).
-static void maybe_tamper_carry(SplitBlockCarryState &c, std::size_t i) {
-    const char *e = getenv("GKR_TAMPER_CARRY");
-    if (!e || (std::size_t)atoi(e) != i || c.input_data.empty()) return;
+// GKR_TAMPER_CARRY=<i>
+static void maybe_tamper_carry(SplitBlockCarryState& c, std::size_t i) {
+    const char* e = getenv("GKR_TAMPER_CARRY");
+    if (!e || (std::size_t)atoi(e) != i || c.input_data.empty())
+        return;
     const std::size_t k = c.input_data.size() / 3;
     c.input_data[k] = c.input_data[k] + F(1);
     std::cerr << "[split] GKR_TAMPER_CARRY: partition " << i << " carry[" << k << "] += 1\n";
 }
 
-// GKR_DUMP_CARRY=1: fingerprint carry-in and the built witness VALUES, so the
-// sequential / --concurrent / --batched runners can be shown to build the same
-// circuit. Shape equality is not enough -- shapes matching while values did not is
-// exactly what hid the witness-cache key collision.
+// GKR_DUMP_CARRY=1
 static unsigned long long fp_mix(unsigned long long h, unsigned long long v) {
     h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     return h;
 }
-static unsigned long long fp_fvec(const std::vector<F> &v) {
+static unsigned long long fp_fvec(const std::vector<F>& v) {
     static_assert(sizeof(F) % sizeof(unsigned long long) == 0, "F must be u64-aligned");
     constexpr std::size_t kU = sizeof(F) / sizeof(unsigned long long);
     unsigned long long h = 1469598103934665603ULL;
     unsigned long long buf[kU];
-    for (const auto &x : v) {
+    for (const auto& x : v) {
         std::memcpy(buf, &x, sizeof(buf));
-        for (std::size_t j = 0; j < kU; ++j) h = fp_mix(h, buf[j]);
+        for (std::size_t j = 0; j < kU; ++j)
+            h = fp_mix(h, buf[j]);
     }
     return fp_mix(h, v.size());
 }
 
-// A forked child's share of the run's thread pool (cfg.num_threads = the whole box's budget).
-// Set right after fork: the child's prover/witgen take max_threads from it, and the OpenMP
-// default team size (every pragma without num_threads, plus hyrax's compute_RT, which sizes
-// itself off omp_get_max_threads) follows it -- otherwise an unpinned child's default team is
-// the whole affinity mask (384) and its prover's max_threads the whole budget (192).
-// 0 = not a child (monolith, parent): everything keeps cfg.num_threads.
+// A forked child's share of the run's thread pool
 static int g_child_threads = 0;
-static void child_threads_set(int t) { g_child_threads = std::max(1, t); omp_set_num_threads(g_child_threads); }
+static void child_threads_set(int t) {
+    g_child_threads = std::max(1, t);
+    omp_set_num_threads(g_child_threads);
+}
 
-static bool build_partition(const SplitCfg &cfg, std::size_t i,
-                            SplitBlockCarryState *carry_in, PartitionState &st,
-                            std::function<void(const prover &)> on_values_ready = {},
-                            std::function<void(int &, int &)> on_before_values = {}) {
+static bool build_partition(const SplitCfg& cfg, std::size_t i, SplitBlockCarryState* carry_in,
+                            PartitionState& st, std::function<void(const prover&)> on_values_ready = {},
+                            std::function<void(int&, int&)> on_before_values = {}) {
     const bool is_first = (i == 0);
-    const bool is_last  = (i + 1 == cfg.nparts());
+    const bool is_last = (i + 1 == cfg.nparts());
     const bool output_private = !is_last;
-    const bool input_private  = !is_first;
+    const bool input_private = !is_first;
     const bool input_separate = is_first && !is_last;
 
     zkgpt_phase::set_part((long long)i);
-    // Mirrors the ZKGPT_ROCTX_SCOPEF("part%zu") in prove_built_partition so the
-    // profiler can attribute witgen dispatches to a partition.
     ZKGPT_ROCTX_SCOPEF("part%zu_build", i);
     ZKGPT_PHASE_SCOPE("build");
     apply_part_knobs(cfg, i);
 
-    // readFconWeight fills weights with rand()%1024, so they depend on how many
-    // rand() calls preceded them IN THIS PROCESS. Forked children all inherit the
-    // same state and would regenerate partition 0's weights -- a self-consistent
-    // proof of the WRONG model that still ACCEPTs. Re-seed per partition so the
-    // weights are a function of i alone. Unset = upstream call-order behaviour.
-    if (const char *s = getenv("ZKGPT_WEIGHT_SEED"))
+    // readFconWeight fills weights with rand()%1024
+    if (const char* s = getenv("ZKGPT_WEIGHT_SEED"))
         srand((unsigned)(atoi(s) + 7919u * (unsigned)i));
 
     st.p.reset(new prover());
     st.p->max_threads = g_child_threads > 0 ? g_child_threads : cfg.num_threads;
-    // modular-zkp's block and flags: output private unless
-    // last, input private unless first, input committed separately on the first.
-    st.net.reset(new LLMSplitBlock(cfg.split_depths[i], cfg.embed_size / 64, 64,
-                                   cfg.embed_size, cfg.lin_dim, cfg.len,
-                                   output_private, input_private, /*input_separate=*/is_first,
+    st.net.reset(new LLMSplitBlock(cfg.split_depths[i], cfg.embed_size / 64, 64, cfg.embed_size, cfg.lin_dim,
+                                   cfg.len, output_private, input_private, /*input_separate=*/is_first,
                                    nullptr, nullptr));
     if (carry_in) {
-        if (!on_before_values) maybe_tamper_carry(*carry_in, i);   // prebuild: tampered in the hook
+        if (!on_before_values)
+            maybe_tamper_carry(*carry_in, i);  // prebuild: tampered in the hook
         st.net->initStateFromCarry(*carry_in);
         st.carry_n = carry_in->input_offset == 0 ? (long long)carry_in->input_data.size() : 0;
     }
     st.net->on_values_ready = std::move(on_values_ready);
     st.net->on_before_values = std::move(on_before_values);
-    // Probed layout, also for the monolith.
-    // tiws[i]==0 would shift 1<<-1 in setTotalInputWitnessSize; the probe never yields 0.
+    // Probed layout
     if (cfg.tiws[i] > 0)
         st.net->setTotalInputWitnessSize(cfg.tiws[i]);
-    if (!is_first) st.p->include_input_commit_size = false;
+    if (!is_first)
+        st.p->include_input_commit_size = false;
 
-    // create() STARTS circuit_timer and verifier::prove() stops it -- do not bracket
-    // it here or the timer double-starts. part_idx=i keeps the witness cache key from
-    // colliding across sibling partitions. Witgen is exactly this call.
+    // create() STARTS circuit_timer and verifier::prove() stops it
     zkgpt_witgen::acc().clear();
     zkgpt_gpu::gkr_vram_peak_reset();
     zkgpt_gpu::gkr_xfer_reset();
@@ -297,20 +257,19 @@ static bool build_partition(const SplitCfg &cfg, std::size_t i,
         st.net->create(*st.p, kMerge, st.circuit_timer, (int)i);
     }
     st.build_s = (prof_now_us() - t_build0) / 1e6;
-    st.wg      = zkgpt_witgen::acc();
-    st.fc_s    = zkgpt_witgen::acc().fc_s;
+    st.wg = zkgpt_witgen::acc();
+    st.fc_s = zkgpt_witgen::acc().fc_s;
     st.gates_s = st.build_s - st.fc_s;
 
-    st.witgen_gpu_peak_mib  = zkgpt_gpu::gkr_vram_peak_mib();
+    st.witgen_gpu_peak_mib = zkgpt_gpu::gkr_vram_peak_mib();
     st.witgen_host_peak_mib = prof_status_kb("VmHWM:") / 1024.0;
-    st.witgen_resident_mib  = prof_status_kb("VmRSS:") / 1024.0;
-    st.witgen_h2d_gib = zkgpt_gpu::gkr_xfer_h2d_gib()
-                       + (double)g1_msm_xfer_h2d_bytes() / (1024.0 * 1024.0 * 1024.0);
+    st.witgen_resident_mib = prof_status_kb("VmRSS:") / 1024.0;
+    st.witgen_h2d_gib =
+        zkgpt_gpu::gkr_xfer_h2d_gib() + (double)g1_msm_xfer_h2d_bytes() / (1024.0 * 1024.0 * 1024.0);
     st.witgen_d2h_gib = zkgpt_gpu::gkr_xfer_d2h_gib();
     if (getenv("GKR_XFER_TIME"))
         fprintf(stderr, "[xfer-time] witgen h2d_s=%.3f d2h_s=%.3f of build_s=%.3f\n",
-                zkgpt_gpu::gkr_xfer_h2d_s_ref(), zkgpt_gpu::gkr_xfer_d2h_s_ref(),
-                st.build_s);
+                zkgpt_gpu::gkr_xfer_h2d_s_ref(), zkgpt_gpu::gkr_xfer_d2h_s_ref(), st.build_s);
     prof_reset_peak_rss();
     zkgpt_gpu::gkr_xfer_reset();
     g1_msm_xfer_reset();
@@ -323,58 +282,46 @@ static bool build_partition(const SplitCfg &cfg, std::size_t i,
 
     if (getenv("GKR_DUMP_CARRY")) {
         unsigned long long wf = 1469598103934665603ULL;
-        for (const auto &lv : st.p->val) wf = fp_mix(wf, fp_fvec(lv));
-        std::cout << "CARRY_FP idx=" << i
-                  << " carry_in=" << (carry_in ? fp_fvec(carry_in->input_data) : 0ULL)
-                  << " carry_in_len=" << (carry_in ? carry_in->len : -1)
-                  << " c_off=" << (carry_in ? carry_in->input_offset : -1)
-                  << " c_fdim=" << (carry_in ? carry_in->feature_dim : -1)
-                  << " c_ce=" << (carry_in ? carry_in->input_c : -1)
-                  << "," << (carry_in ? carry_in->input_e : -1)
-                  << " carry_in_mib=" << (carry_in
-                      ? carry_in->input_data.size() * sizeof(F) / 1048576.0 : 0.0)
-                  << " val0_mib=" << (st.p->val.empty() ? 0.0
-                      : st.p->val[0].size() * sizeof(F) / 1048576.0)
-                  << " witness=" << wf
-                  << " out_fp=" << fp_fvec(st.p->val.back())
-                  << " out_n=" << st.p->val.back().size()
-                  << " out_nz=" << std::count_if(st.p->val.back().begin(), st.p->val.back().end(),
-                                                 [](const F &x) { return !x.isZero(); })
-                  << " in_prefix_fp=" << (is_first || st.p->val.empty() ? 0ULL
-                      : fp_fvec(std::vector<F>(st.p->val[0].begin(),
-                                               st.p->val[0].begin() + std::min<std::size_t>(
-                                                   cfg.scs[i - 1], st.p->val[0].size()))))
-                  << " nlayers=" << st.p->val.size()
-                  << " first=" << (int)is_first << " last=" << (int)is_last
-                  << " outpriv=" << (int)output_private
-                  << " inpriv=" << (int)input_private
-                  << " insep=" << (int)input_separate
-                  << " tiws=" << cfg.tiws[i] << " scs=" << cfg.scs[i]
-                  << " pid=" << (long)getpid() << std::endl;
+        for (const auto& lv : st.p->val)
+            wf = fp_mix(wf, fp_fvec(lv));
+        std::cout
+            << "CARRY_FP idx=" << i << " carry_in=" << (carry_in ? fp_fvec(carry_in->input_data) : 0ULL)
+            << " carry_in_len=" << (carry_in ? carry_in->len : -1)
+            << " c_off=" << (carry_in ? carry_in->input_offset : -1)
+            << " c_fdim=" << (carry_in ? carry_in->feature_dim : -1)
+            << " c_ce=" << (carry_in ? carry_in->input_c : -1) << "," << (carry_in ? carry_in->input_e : -1)
+            << " carry_in_mib=" << (carry_in ? carry_in->input_data.size() * sizeof(F) / 1048576.0 : 0.0)
+            << " val0_mib=" << (st.p->val.empty() ? 0.0 : st.p->val[0].size() * sizeof(F) / 1048576.0)
+            << " witness=" << wf << " out_fp=" << fp_fvec(st.p->val.back())
+            << " out_n=" << st.p->val.back().size() << " out_nz="
+            << std::count_if(st.p->val.back().begin(), st.p->val.back().end(),
+                             [](const F& x) { return !x.isZero(); })
+            << " in_prefix_fp="
+            << (is_first || st.p->val.empty()
+                    ? 0ULL
+                    : fp_fvec(std::vector<F>(
+                          st.p->val[0].begin(),
+                          st.p->val[0].begin() + std::min<std::size_t>(cfg.scs[i - 1], st.p->val[0].size()))))
+            << " nlayers=" << st.p->val.size() << " first=" << (int)is_first << " last=" << (int)is_last
+            << " outpriv=" << (int)output_private << " inpriv=" << (int)input_private
+            << " insep=" << (int)input_separate << " tiws=" << cfg.tiws[i] << " scs=" << cfg.scs[i]
+            << " pid=" << (long)getpid() << std::endl;
     }
     return true;
 }
 
-// Per-job body of run_verifiers_parallel, in its order: boundary commits, then
-// rp->prove / executeCommit / range_prove / prove. Each partition commits its OWN
-// input prefix rather than inheriting its predecessor's output commitment, which is
-// what makes partitions independent enough to be separate processes.
-// `threads` is passed, not read off cfg, so the concurrent runner splits one host
-// budget across children -- the full count each made it use W times the CPU.
-static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
-                                  PartitionState &st, PartResult &res, int threads) {
-    st.p->max_threads = threads;   // --concurrent/--batched build in the parent at the full budget
+// Per-job body: runs after the instance is built.
+static bool prove_built_partition(const SplitCfg& cfg, std::size_t i, PartitionState& st, PartResult& res,
+                                  int threads) {
+    st.p->max_threads = threads;  // concurrent/--batched build in the parent at the full budget
     const bool is_first = (i == 0);
-    const bool is_last  = (i + 1 == cfg.nparts());
+    const bool is_last = (i + 1 == cfg.nparts());
     const bool is_split = !is_first || !is_last;
 
-    prover *p = st.p.get();
+    prover* p = st.p.get();
     const double t_part0 = prof_now_us();
     zkgpt_phase::set_part((long long)i);
-    // Deliberately ZKGPT_PHASE and not ZKGPT_PHASE_SCOPE: the ROCTx side of this exact
-    // region is the enclosing ZKGPT_ROCTX_SCOPEF("part%zu") below, which the profiler
-    // needs as the PARTITION-owner range rather than as a phase. Adding a second range named "prove" here
-    // would double-count every dispatch in the partition.
+    // Deliberately ZKGPT_PHASE and not ZKGPT_PHASE_SCOPE
     ZKGPT_PHASE("prove");
     zkgpt_acct::reset();
     zkgpt_gpu::gkr_xfer_wall_reset();
@@ -383,28 +330,20 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
     g1_msm_xfer_reset();
     ZKGPT_ROCTX_SCOPEF("part%zu", i);
 
-    // MUST be constructed before ANY commit work: the verifier ctor calls p->init(),
-    // which resets cc / cc_input / cc_output / input_commit_segments. Building it
-    // after executeCommit silently wiped the input commitment and left openCommit
-    // dereferencing a null cc.w.
+    // MUST be constructed before ANY commit work
     double t_standalone = 0, t_output = 0, t_range_build = 0, t_range = 0, t_exec = 0, t_gkr = 0;
     verifier v(p, p->C);
-    // The thread count is read off the member, not prove()'s argument; 0 divides by
-    // zero in init_book_keeping_fast.
+    // The thread count is read off the member, not prove()'s argument
     v.max_threads = threads;
 
-    // input_copy is never populated; the prefix comes from val[0] (see executeCommit).
-    if (!is_first && p->inp_end_id > 0 &&
-        p->inp_end_id < static_cast<i64>(p->val[0].size())) {
+    // input_copy is never populated
+    if (!is_first && p->inp_end_id > 0 && p->inp_end_id < static_cast<i64>(p->val[0].size())) {
         ZKGPT_PHASE_SCOPE("standalone_input_commit");
         zkgpt_witgen::Scope _ts(t_standalone);
         timer prefix_commit_timer;
-        // Same commitment as commit_values_standalone(prefix), built straight from
-        // val[0]: no prefix copy, and only the real (non-zero) head is converted.
+        // Same commitment as commit_values_standalone(prefix)
         p->cc_input = p->commitInputPrefixFast((size_t)p->inp_end_id, threads, &prefix_commit_timer);
-        // Self-allocated: commit_values_standalone new[]s w/ww/comm AND its own
-        // generator array (unlike commit_segment, which aliases the caller's). Opt
-        // into destructor cleanup, else one prefix commitment leaks per partition.
+        // Self-allocated
         p->cc_input_owned = true;
         p->cc_input_owns_gens = true;
         res.standalone_commit += prefix_commit_timer.elapse_sec();
@@ -417,11 +356,8 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
         commit_private_output_for_next(*p, cfg.scs[i], threads);
     }
 
-    // rp.init()/rp.build() are not in rp.prove()'s time and executeCommit lands in
-    // p->commit_time, not v.prover_time, so both are timed explicitly. `merged`
-    // tracks the builder's merge flag.
-    range_prover rp(cfg.split_depths[i], cfg.embed_size / 64, 64,
-                    cfg.embed_size, cfg.lin_dim, cfg.len, threads,
+    range_prover rp(cfg.split_depths[i], cfg.embed_size / 64, 64, cfg.embed_size, cfg.lin_dim, cfg.len,
+                    threads,
                     /*merged=*/kMerge);
     timer rp_build_timer;
     rp_build_timer.start();
@@ -433,17 +369,15 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
     }
     rp_build_timer.stop();
 
-    // Per-partition Blendy/deg3 sub-phase accounting.
-    // OFF by default: `.on` inserts hipStreamSynchronize inside product_sumcheck,
-    // which perturbs the very launch/sync structure this is meant to measure. Enabled here rather than
-    // around v.prove() alone so the RANGE prover's deg3 lands in the same window.
+    // Per-partition Blendy/deg3 sub-phase accounting
     const bool mm_prof = getenv("GKR_MM_PROF") != nullptr;
     if (mm_prof) {
-        zkgpt_gpu::g_matmul_timers.reset(); zkgpt_gpu::g_matmul_timers.on = true;
-        zkgpt_gpu::g_deg3_timer.reset();    zkgpt_gpu::g_deg3_timer.on    = true;
+        zkgpt_gpu::g_matmul_timers.reset();
+        zkgpt_gpu::g_matmul_timers.on = true;
+        zkgpt_gpu::g_deg3_timer.reset();
+        zkgpt_gpu::g_deg3_timer.on = true;
     }
-    // Reset unconditionally: these cost two clock reads per layer, so they are always
-    // accumulated, and sumcheckLassoInit runs inside v.prove() below.
+    // Reset unconditionally
     g_lasso_init_timers.reset();
 
     double rp_time;
@@ -455,23 +389,17 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
 
     timer exec_commit_timer;
     exec_commit_timer.start();
-    fprintf(stderr, "COMMIT_SIGNAL partition=%zu phase=start t_us=%.0f\n",
-            i, prof_now_us());
+    fprintf(stderr, "COMMIT_SIGNAL partition=%zu phase=start t_us=%.0f\n", i, prof_now_us());
     {
-        // Unconditional: create() does not commit, so skipping this leaves comm.w null
-        // and openCommit segfaults in compute_RT.
-        // Also the only place external_input_segments get bound.
+        // Unconditional
         ZKGPT_PHASE_SCOPE("execute_commit");
         zkgpt_witgen::Scope _ts(t_exec);
         p->executeCommit(threads);
     }
     exec_commit_timer.stop();
-    fprintf(stderr, "COMMIT_SIGNAL partition=%zu phase=end t_us=%.0f\n",
-            i, prof_now_us());
+    fprintf(stderr, "COMMIT_SIGNAL partition=%zu phase=end t_us=%.0f\n", i, prof_now_us());
 
-    // Boundary link (boundary_link.hpp). Runs only when the runner created the
-    // arena, i.e. on a split run -- never at splits=1. Both of this partition's
-    // boundaries publish here, right after the commitments they open exist.
+    // Boundary link (boundary_link.hpp)
     if (zkmod_link::arena() && is_split) {
         ZKGPT_PHASE_SCOPE("boundary_link");
         bool link_ok = true;
@@ -481,9 +409,9 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
                 std::cerr << "[link] partition " << i << ": no carry window\n";
                 link_ok = false;
             } else {
-                std::vector<const Commit_return *> segs;
+                std::vector<const Commit_return*> segs;
                 std::vector<long long> starts;
-                for (auto &seg : p->input_commit_segments)
+                for (auto& seg : p->input_commit_segments)
                     if (!seg.external_commit && seg.commit.comm) {
                         segs.push_back(&seg.commit);
                         starts.push_back((long long)seg.start);
@@ -496,11 +424,12 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
                 std::cerr << "[link] partition " << i << ": no input-prefix commitment\n";
                 link_ok = false;
             } else {
-                link_ok = zkmod_link::publish((int)i - 1, false, {&p->cc_input}, {0LL},
-                                              0, st.carry_n, (int)i);
+                link_ok =
+                    zkmod_link::publish((int)i - 1, false, {&p->cc_input}, {0LL}, 0, st.carry_n, (int)i);
             }
         }
-        if (!link_ok) return false;
+        if (!link_ok)
+            return false;
     }
 
     v.range_prove(rp_time);
@@ -508,213 +437,138 @@ static bool prove_built_partition(const SplitCfg &cfg, std::size_t i,
     {
         ZKGPT_PHASE_SCOPE("gkr_prove");
         zkgpt_witgen::Scope _ts(t_gkr);
-        // prove() short-circuits on the first failed stage; discarding its result
-        // would let a REJECT exit 0.
+        // prove() short-circuits on the first failed stage
         accepted = v.prove(threads, st.circuit_timer);
     }
     if (mm_prof) {
         zkgpt_gpu::g_matmul_timers.on = false;
-        zkgpt_gpu::g_deg3_timer.on    = false;
+        zkgpt_gpu::g_deg3_timer.on = false;
     }
 
     const double output_commit_s = p->outputCommitTimerRange().duration_sec;
 
-    res.prover_core   = v.prover_time;
+    res.prover_core = v.prover_time;
     res.output_commit = output_commit_s;
-    res.verifier      = v.verifier_time;
-    res.proof_kb      = static_cast<double>(p->proof_size) / 1024.0;
+    res.verifier = v.verifier_time;
+    res.proof_kb = static_cast<double>(p->proof_size) / 1024.0;
 
-    // prover_core_s = standalone_commit + prover_time + output_commit.
+    // prover_core_s = standalone_commit + prover_time + output_commit
     const double core = res.standalone_commit + v.prover_time + output_commit_s;
     const double t_part1 = prof_now_us();
-    std::cout << "PARTITION idx=" << i
-              << " len=" << cfg.len
-              << " layers=" << cfg.split_depths[i]
-              << " c=" << gkr_config.range_c
-              << " matmul_k=" << gkr_config.matmul_k
-              << " range_k=" << gkr_config.range_k
-              << " lasso_k=" << gkr_config.lasso_k
-              << " lasso_l=" << gkr_config.lasso_l
-              << " t0_us=" << (long long)t_part0
-              << " t1_us=" << (long long)t_part1
-              << " time_s=" << (t_part1 - t_part0) / 1e6
-              << " circuit_s=" << st.circuit_timer.elapse_sec()
-              << " prover_s=" << v.prover_time
-              << " commit_s=" << output_commit_s
-              << " standalone_commit_s=" << res.standalone_commit
-              << " range_s=" << rp_time
-              << " range_build_s=" << rp_build_timer.elapse_sec()
-              << " exec_commit_s=" << exec_commit_timer.elapse_sec()
-              << " prover_zkgpt_s=" << core
-              << " prover_core_s="  << core
-              << " prover_total_s=" << (core + rp_time)
-              << " verifier_s=" << res.verifier          // this partition's verifier time
-              << " proof_kb=" << res.proof_kb            // this partition's proof size
+    std::cout << "PARTITION idx=" << i << " len=" << cfg.len << " layers=" << cfg.split_depths[i]
+              << " c=" << gkr_config.range_c << " matmul_k=" << gkr_config.matmul_k
+              << " range_k=" << gkr_config.range_k << " lasso_k=" << gkr_config.lasso_k
+              << " lasso_l=" << gkr_config.lasso_l << " t0_us=" << (long long)t_part0
+              << " t1_us=" << (long long)t_part1 << " time_s=" << (t_part1 - t_part0) / 1e6
+              << " circuit_s=" << st.circuit_timer.elapse_sec() << " prover_s=" << v.prover_time
+              << " commit_s=" << output_commit_s << " standalone_commit_s=" << res.standalone_commit
+              << " range_s=" << rp_time << " range_build_s=" << rp_build_timer.elapse_sec()
+              << " exec_commit_s=" << exec_commit_timer.elapse_sec() << " prover_zkgpt_s=" << core
+              << " prover_core_s=" << core << " prover_total_s=" << (core + rp_time)
+              << " verifier_s=" << res.verifier  // this partition's verifier time
+              << " proof_kb=" << res.proof_kb    // this partition's proof size
               << " ph_gkr_generic=" << v.phase_s[verifier::PH_GKR_GENERIC]
-              << " ph_gkr_matmul="  << v.phase_s[verifier::PH_GKR_MATMUL]
-              << " ph_lasso="       << v.phase_s[verifier::PH_LASSO]
-              << " ph_hyrax_commit="<< v.phase_s[verifier::PH_HYRAX_COMMIT]
-              << " ph_hyrax_open="  << v.phase_s[verifier::PH_HYRAX_OPEN]
+              << " ph_gkr_matmul=" << v.phase_s[verifier::PH_GKR_MATMUL]
+              << " ph_lasso=" << v.phase_s[verifier::PH_LASSO]
+              << " ph_hyrax_commit=" << v.phase_s[verifier::PH_HYRAX_COMMIT]
+              << " ph_hyrax_open=" << v.phase_s[verifier::PH_HYRAX_OPEN]
               << " gpu_peak_mib=" << zkgpt_gpu::gkr_vram_peak_mib()
-              << " host_peak_mib=" << prof_status_kb("VmHWM:") / 1024.0
-              << " prove_h2d_gib=" << (zkgpt_gpu::gkr_xfer_h2d_gib()
-                  + (double)g1_msm_xfer_h2d_bytes() / (1024.0 * 1024.0 * 1024.0))
-              << " prove_d2h_gib=" << zkgpt_gpu::gkr_xfer_d2h_gib()
-              // Real witness-gen split. witgen_s is disjoint from time_s;
-              // circuit_s is NOT (see PartitionState).
-              << " witgen_s=" << st.build_s
-              << " witgen_fc_s=" << st.fc_s
-              << " witgen_gates_s=" << st.gates_s
+              << " host_peak_mib=" << prof_status_kb("VmHWM:") / 1024.0 << " prove_h2d_gib="
+              << (zkgpt_gpu::gkr_xfer_h2d_gib() +
+                  (double)g1_msm_xfer_h2d_bytes() / (1024.0 * 1024.0 * 1024.0))
+              << " prove_d2h_gib="
+              << zkgpt_gpu::gkr_xfer_d2h_gib()
+              // Real witness-gen split. witgen_s is disjoint from time_s
+              << " witgen_s=" << st.build_s << " witgen_fc_s=" << st.fc_s << " witgen_gates_s=" << st.gates_s
               << " witgen_gpu_peak_mib=" << st.witgen_gpu_peak_mib
               << " witgen_host_peak_mib=" << st.witgen_host_peak_mib
-              << " witgen_resident_mib=" << st.witgen_resident_mib
-              << " witgen_h2d_gib=" << st.witgen_h2d_gib
-              << " witgen_d2h_gib=" << st.witgen_d2h_gib
-              << std::endl;
+              << " witgen_resident_mib=" << st.witgen_resident_mib << " witgen_h2d_gib=" << st.witgen_h2d_gib
+              << " witgen_d2h_gib=" << st.witgen_d2h_gib << std::endl;
     {
-        // The four-way split: witness generation / input layer / circuit construction
-        // / proof. Builders compute values AND emit gate lists in one fused pass, so
-        // gate emission lands in wg_witness_s; wg_circuit_s is the post-builder
-        // construction (merge, gate-readback drain, initSubset, counting, output
-        // padding) plus teardown. Proof: commit = input-prefix + output + input
-        // (executeCommit) commits + the Hyrax commits inside the GKR prover;
-        // input_check = the Hyrax opening of the input layer; range = range build +
-        // range prove (its own commits included); pf_other_s = the rest of the prove
-        // wall (verification and the GKR prover's unattributed time).
-        const zkgpt_witgen::Accum &w = st.wg;
+        // The four-way split: witness generation / input layer / circuit construction / proof
+        const zkgpt_witgen::Accum& w = st.wg;
         const double wg_witness = w.init_s + w.values_s;
-        const double wg_input   = w.inlayer_s + w.copyin_s;
-        const double wg_circuit = w.merge_s + w.sync_s + w.subset_s + w.misc_s
-                                + w.teardown_s + st.pad_s;
-        // build_s brackets create() only; the output padding runs after it.
-        const double wg_other   = st.build_s - (wg_witness + wg_input + w.carry_s
-                                                + (wg_circuit - st.pad_s));
-        const double pf_commit  = t_standalone + t_output + t_exec
-                                + v.phase_s[verifier::PH_HYRAX_COMMIT];
-        const double pf_lasso   = v.phase_s[verifier::PH_LASSO];
-        const double pf_sc      = v.phase_s[verifier::PH_GKR_GENERIC]
-                                + v.phase_s[verifier::PH_GKR_MATMUL];
-        const double pf_input   = v.phase_s[verifier::PH_HYRAX_OPEN];
-        const double pf_range   = t_range_build + t_range;
-        const double pf_wall    = (t_part1 - t_part0) / 1e6;
-        const double pf_other   = pf_wall - (pf_commit + pf_lasso + pf_sc + pf_input + pf_range);
-        std::cout << "TIMING_SPLIT idx=" << i
-                  << " wg_witness_s=" << wg_witness
-                  << " wg_input_init_s=" << wg_input
-                  << " wg_circuit_s=" << wg_circuit
-                  << " wg_carry_s=" << w.carry_s
-                  << " wg_other_s=" << wg_other
-                  << " pf_commit_s=" << pf_commit
-                  << " pf_lasso_s=" << pf_lasso
-                  << " pf_sumcheck_s=" << pf_sc
-                  << " pf_input_check_s=" << pf_input
-                  << " pf_range_s=" << pf_range
-                  << " pf_other_s=" << pf_other
-                  << " pf_verify_s=" << res.verifier
+        const double wg_input = w.inlayer_s + w.copyin_s;
+        const double wg_circuit = w.merge_s + w.sync_s + w.subset_s + w.misc_s + w.teardown_s + st.pad_s;
+        // build_s brackets create() only
+        const double wg_other = st.build_s - (wg_witness + wg_input + w.carry_s + (wg_circuit - st.pad_s));
+        const double pf_commit = t_standalone + t_output + t_exec + v.phase_s[verifier::PH_HYRAX_COMMIT];
+        const double pf_lasso = v.phase_s[verifier::PH_LASSO];
+        const double pf_sc = v.phase_s[verifier::PH_GKR_GENERIC] + v.phase_s[verifier::PH_GKR_MATMUL];
+        const double pf_input = v.phase_s[verifier::PH_HYRAX_OPEN];
+        const double pf_range = t_range_build + t_range;
+        const double pf_wall = (t_part1 - t_part0) / 1e6;
+        const double pf_other = pf_wall - (pf_commit + pf_lasso + pf_sc + pf_input + pf_range);
+        std::cout << "TIMING_SPLIT idx=" << i << " wg_witness_s=" << wg_witness
+                  << " wg_input_init_s=" << wg_input << " wg_circuit_s=" << wg_circuit
+                  << " wg_carry_s=" << w.carry_s << " wg_other_s=" << wg_other << " pf_commit_s=" << pf_commit
+                  << " pf_lasso_s=" << pf_lasso << " pf_sumcheck_s=" << pf_sc
+                  << " pf_input_check_s=" << pf_input << " pf_range_s=" << pf_range
+                  << " pf_other_s=" << pf_other << " pf_verify_s="
+                  << res.verifier
                   // components, so a category can be re-cut without a rerun
                   << " wg_init_s=" << w.init_s << " wg_values_s=" << w.values_s
                   << " wg_inlayer_s=" << w.inlayer_s << " wg_copyin_s=" << w.copyin_s
-                  << " wg_merge_s=" << w.merge_s << " wg_sync_s=" << w.sync_s
-                  << " wg_subset_s=" << w.subset_s << " wg_misc_s=" << w.misc_s
-                  << " wg_teardown_s=" << w.teardown_s << " wg_pad_s=" << st.pad_s
-                  << " pf_standalone_commit_s=" << t_standalone
-                  << " pf_output_commit_s=" << t_output
-                  << " pf_exec_commit_s=" << t_exec
+                  << " wg_merge_s=" << w.merge_s << " wg_sync_s=" << w.sync_s << " wg_subset_s=" << w.subset_s
+                  << " wg_misc_s=" << w.misc_s << " wg_teardown_s=" << w.teardown_s
+                  << " wg_pad_s=" << st.pad_s << " pf_standalone_commit_s=" << t_standalone
+                  << " pf_output_commit_s=" << t_output << " pf_exec_commit_s=" << t_exec
                   << " pf_hyrax_commit_s=" << v.phase_s[verifier::PH_HYRAX_COMMIT]
-                  << " pf_range_build_s=" << t_range_build
-                  << " pf_range_prove_s=" << t_range
-                  << " pf_gkr_wall_s=" << t_gkr
-                  << " build_s=" << st.build_s << " prove_s=" << pf_wall
+                  << " pf_range_build_s=" << t_range_build << " pf_range_prove_s=" << t_range
+                  << " pf_gkr_wall_s=" << t_gkr << " build_s=" << st.build_s << " prove_s=" << pf_wall
                   << std::endl;
     }
     zkgpt_acct::report("part", (int)i);
-    { extern void gkr_ip_report_pub(int); gkr_ip_report_pub((int)i); }
+    {
+        extern void gkr_ip_report_pub(int);
+        gkr_ip_report_pub((int)i);
+    }
     if (getenv("GKR_ACCT"))
-        fprintf(stderr, "[acct] part idx=%d %-26s h2d=%.3fs d2h=%.3fs "
-                "(%.2f GiB h2d, %.2f GiB d2h)\n", (int)i, "PCIe blocking copies",
-                zkgpt_gpu::gkr_h2d_time_s(), zkgpt_gpu::gkr_d2h_time_s(),
+        fprintf(stderr,
+                "[acct] part idx=%d %-26s h2d=%.3fs d2h=%.3fs "
+                "(%.2f GiB h2d, %.2f GiB d2h)\n",
+                (int)i, "PCIe blocking copies", zkgpt_gpu::gkr_h2d_time_s(), zkgpt_gpu::gkr_d2h_time_s(),
                 zkgpt_gpu::gkr_xfer_h2d_gib(), zkgpt_gpu::gkr_xfer_d2h_gib());
     v.report_totals();
     gkr_sc_report();
     {
-        // Splits the largest host-side item in the prover. `scatter_mps` is the rate
-        // the scatter achieves.
+        // Splits the largest host-side item in the prover
         auto& LI = g_lasso_init_timers;
-        std::cout << "LASSO_INIT idx=" << i
-                  << " beta_s="    << LI.beta
-                  << " scatter_s=" << LI.scatter
-                  << " total_s="   << (LI.beta + LI.scatter)
-                  << " scattered=" << LI.scattered
-                  << " scatter_mps=" << (LI.scatter > 0
-                                         ? (double)LI.scattered / LI.scatter / 1e6 : 0.0)
+        std::cout << "LASSO_INIT idx=" << i << " beta_s=" << LI.beta << " scatter_s=" << LI.scatter
+                  << " total_s=" << (LI.beta + LI.scatter) << " scattered=" << LI.scattered << " scatter_mps="
+                  << (LI.scatter > 0 ? (double)LI.scattered / LI.scatter / 1e6 : 0.0)
                   // verifyLasso's binding-check tail
-                  << " bind_beta_g_s="  << LI.bind_beta_g
-                  << " bind_beta_uv_s=" << LI.bind_beta_uv
-                  << " bind_gather_s="  << LI.bind_gather
-                  << " bind_total_s="   << (LI.bind_beta_g + LI.bind_beta_uv + LI.bind_gather)
-                  << " gathered="       << LI.gathered
-                  << " gather_mps="     << (LI.bind_gather > 0
-                                            ? (double)LI.gathered / LI.bind_gather / 1e6 : 0.0)
-                  << " alloc_s="     << LI.lasso_alloc
-                  << " sc_call_s="   << LI.lasso_sc_call
-                  << " barrier_s="   << LI.lasso_barrier
-                  // A non-zero residual means a PH_LASSO region is still untimed.
-                  << " mm_pa_s="     << LI.mm_pa
-                  << " mm_pb_s="     << LI.mm_pb
-                  << " mm_sc_s="     << LI.mm_sc
-                  << " mm_layers="   << LI.mm_layers
-                  << " mm_acct_s="   << (LI.mm_pa + LI.mm_pb + LI.mm_sc)
-                  << " lasso_acct_s=" << (LI.lasso_alloc + LI.beta + LI.scatter
-                                          + LI.lasso_sc_call + LI.lasso_barrier
-                                          + LI.bind_beta_g + LI.bind_beta_uv
-                                          + LI.bind_gather)
+                  << " bind_beta_g_s=" << LI.bind_beta_g << " bind_beta_uv_s=" << LI.bind_beta_uv
+                  << " bind_gather_s=" << LI.bind_gather
+                  << " bind_total_s=" << (LI.bind_beta_g + LI.bind_beta_uv + LI.bind_gather)
+                  << " gathered=" << LI.gathered
+                  << " gather_mps=" << (LI.bind_gather > 0 ? (double)LI.gathered / LI.bind_gather / 1e6 : 0.0)
+                  << " alloc_s=" << LI.lasso_alloc << " sc_call_s=" << LI.lasso_sc_call << " barrier_s="
+                  << LI.lasso_barrier
+                  // A non-zero residual means a PH_LASSO region is still untimed
+                  << " mm_pa_s=" << LI.mm_pa << " mm_pb_s=" << LI.mm_pb << " mm_sc_s=" << LI.mm_sc
+                  << " mm_layers=" << LI.mm_layers << " mm_acct_s=" << (LI.mm_pa + LI.mm_pb + LI.mm_sc)
+                  << " lasso_acct_s="
+                  << (LI.lasso_alloc + LI.beta + LI.scatter + LI.lasso_sc_call + LI.lasso_barrier +
+                      LI.bind_beta_g + LI.bind_beta_uv + LI.bind_gather)
                   << std::endl;
     }
     if (mm_prof) {
-                auto& MT = zkgpt_gpu::g_matmul_timers;
-        std::cout << "MATMUL_BREAKDOWN idx=" << i
-                  << " expand_s="  << MT.expand
-                  << " ptable_s="  << MT.ptable
-                  << " round_s="   << MT.round
-                  << " fold_s="    << MT.fold
-                  << " deg3_s="    << zkgpt_gpu::g_deg3_timer.gpu
-                  << " bucket_sum_s=" << (MT.expand + MT.ptable + MT.round + MT.fold
-                                          + zkgpt_gpu::g_deg3_timer.gpu)
-                  << " bring_s="     << MT.bring
-                  << " bring_fold_s=" << MT.bring_fold
-                  << " sc_wall_s="   << MT.sc_wall
-                  << " host_wall_s=" << MT.host_wall
-                  // What is left inside product_sumcheck once the kernel brackets and
-                  // the streamed source staging are removed: launch latency, syncs,
-                  // allocation.
-                  // bring_fold is already inside `fold`, so only the expand-side
-                  // staging (bring - bring_fold) is added back.
-                  << " sc_residual_s=" << (MT.sc_wall - (MT.expand + MT.ptable
-                                           + MT.round + MT.fold
-                                           + (MT.bring - MT.bring_fold)))
+        auto& MT = zkgpt_gpu::g_matmul_timers;
+        std::cout << "MATMUL_BREAKDOWN idx=" << i << " expand_s=" << MT.expand << " ptable_s=" << MT.ptable
+                  << " round_s=" << MT.round << " fold_s=" << MT.fold
+                  << " deg3_s=" << zkgpt_gpu::g_deg3_timer.gpu << " bucket_sum_s="
+                  << (MT.expand + MT.ptable + MT.round + MT.fold + zkgpt_gpu::g_deg3_timer.gpu)
+                  << " bring_s=" << MT.bring << " bring_fold_s=" << MT.bring_fold
+                  << " sc_wall_s=" << MT.sc_wall << " host_wall_s=" << MT.host_wall << " sc_residual_s="
+                  << (MT.sc_wall - (MT.expand + MT.ptable + MT.round + MT.fold + (MT.bring - MT.bring_fold)))
                   << std::endl;
     }
     return accepted;
 }
 
-// ── Core pinning for forked children (GKR_PIN_CORES=1) ───────────────────────
-// Without this a child's threads float over all 384 logical CPUs, so "our CPU
-// seconds" is measured against a denominator that includes SMT siblings and
-// whatever another tenant is doing on the same core. With it, child i owns a
-// disjoint block of `per_child` PHYSICAL cores and nothing else runs there, so
-// the sampler's per-partition cores-busy number is exactly that partition's.
-//
-// PHYSICAL cores only, and read from the sibling lists rather than assumed:
-// one thread per physical core (SMT siblings do not help this workload and cost
-// measurably). Blocks of consecutive physical cores usually stay inside one socket.
-//
-// Affinity mask only, no OMP_PROC_BIND: the OpenMP runtime sizes itself from
-// sched_getaffinity, so it already sees exactly `per_child` procs, and letting
-// the OS move threads inside an exclusively-owned block is strictly better
-// than pinning each one to a core it may not be ready to run on.
-static const std::vector<int> &physical_cpus() {
-    // Only CPUs in the inherited affinity mask: under `numactl --cpunodebind=N` the
-    // GKR_PIN_CORES slices must stay on node N (next to its GPUs), not restart at cpu 0.
+static const std::vector<int>& physical_cpus() {
+    // Only CPUs in the inherited affinity mask
     static const std::vector<int> cpus = [] {
         std::vector<int> out;
         std::set<std::string> seen;
@@ -722,85 +576,98 @@ static const std::vector<int> &physical_cpus() {
         CPU_ZERO(&allowed);
         const bool have_mask = sched_getaffinity(0, sizeof allowed, &allowed) == 0;
         for (int c = 0; c < CPU_SETSIZE; ++c) {
-            if (have_mask && !CPU_ISSET(c, &allowed)) continue;
+            if (have_mask && !CPU_ISSET(c, &allowed))
+                continue;
             char path[128];
-            std::snprintf(path, sizeof path,
-                          "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",
+                          c);
             std::ifstream f(path);
-            if (!f) continue;                       // no such cpu
+            if (!f)
+                continue;  // no such cpu
             std::string sibs;
             std::getline(f, sibs);
-            if (seen.insert(sibs).second) out.push_back(c);   // lowest sibling wins
+            if (seen.insert(sibs).second)
+                out.push_back(c);  // lowest sibling wins
         }
         return out;
     }();
     return cpus;
 }
 
-// GKR_PIN_CORES=1: pin each child to its own block of `per_child` physical cores.
-// Blocks are claimed from a MAP_SHARED table when the child starts WORKING (not at
-// fork), lowest free block first, and held until it exits. Pinning by partition
-// index would leave children past the last block unpinned, sizing their OpenMP
-// teams to the whole box. If every block is held, the child shares block (idx % nblocks) rather
-// than run unpinned. Call core_table_init in the parent before forking.
-static int *g_core_owner = nullptr;
+// GKR_PIN_CORES=1: pin each child to its own block of `per_child` physical cores
+static int* g_core_owner = nullptr;
 static int g_core_blocks = 0, g_core_tpc = 0, g_my_block = -1;
 static void core_table_init(int per_child) {
-    if (!getenv("GKR_PIN_CORES") || per_child <= 0 || g_core_owner) return;
+    if (!getenv("GKR_PIN_CORES") || per_child <= 0 || g_core_owner)
+        return;
     g_core_tpc = per_child;
     g_core_blocks = (int)(physical_cpus().size() / (size_t)per_child);
-    if (g_core_blocks <= 0) return;
-    void *raw = mmap(nullptr, sizeof(int) * g_core_blocks, PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (raw == MAP_FAILED) { std::perror("[split] pin: mmap"); return; }
-    g_core_owner = static_cast<int *>(raw);
+    if (g_core_blocks <= 0)
+        return;
+    void* raw =
+        mmap(nullptr, sizeof(int) * g_core_blocks, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        std::perror("[split] pin: mmap");
+        return;
+    }
+    g_core_owner = static_cast<int*>(raw);
     std::memset(g_core_owner, 0, sizeof(int) * g_core_blocks);
 }
 static bool pin_child_cores(int idx) {
-    if (!g_core_owner) return false;
+    if (!g_core_owner)
+        return false;
     int blk = -1;
     for (int b = 0; b < g_core_blocks && blk < 0; ++b) {
         int expect = 0;
-        if (__atomic_compare_exchange_n(&g_core_owner[b], &expect, idx + 1, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) blk = b;
+        if (__atomic_compare_exchange_n(&g_core_owner[b], &expect, idx + 1, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+            blk = b;
     }
     const bool shared = blk < 0;
-    if (shared) blk = idx % g_core_blocks;
-    else g_my_block = blk;
-    const std::vector<int> &cpus = physical_cpus();
+    if (shared)
+        blk = idx % g_core_blocks;
+    else
+        g_my_block = blk;
+    const std::vector<int>& cpus = physical_cpus();
     const size_t first = (size_t)blk * (size_t)g_core_tpc;
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int j = 0; j < g_core_tpc; ++j) CPU_SET(cpus[first + j], &set);
+    for (int j = 0; j < g_core_tpc; ++j)
+        CPU_SET(cpus[first + j], &set);
     if (sched_setaffinity(0, sizeof set, &set) != 0) {
         std::perror("[split] pin: sched_setaffinity");
         return false;
     }
-    std::cerr << "[split] pin: child " << idx << " -> block " << blk << " cpus " << cpus[first]
-              << "-" << cpus[first + g_core_tpc - 1] << " (" << g_core_tpc << " physical cores"
+    std::cerr << "[split] pin: child " << idx << " -> block " << blk << " cpus " << cpus[first] << "-"
+              << cpus[first + g_core_tpc - 1] << " (" << g_core_tpc << " physical cores"
               << (shared ? ", SHARED: every block held" : "") << ")\n";
     return true;
 }
 static void unpin_child_cores() {
-    if (g_core_owner && g_my_block >= 0) __atomic_store_n(&g_core_owner[g_my_block], 0, __ATOMIC_RELEASE);
+    if (g_core_owner && g_my_block >= 0)
+        __atomic_store_n(&g_core_owner[g_my_block], 0, __ATOMIC_RELEASE);
     g_my_block = -1;
 }
 
-// Boundary-link arena for a split run (boundary_link.hpp), created before any fork.
-// Every runner calls it; at splits=1 there is no boundary and nothing is created.
-static bool link_begin(const SplitCfg &cfg) {
+// Boundary-link arena for a split run (boundary_link.hpp), created before any fork
+static bool link_begin(const SplitCfg& cfg) {
     const int nb = (int)cfg.nparts() - 1;
-    if (nb <= 0) return true;
+    if (nb <= 0)
+        return true;
     long long fdim = 1;
-    while (fdim < cfg.embed_size) fdim <<= 1;
+    while (fdim < cfg.embed_size)
+        fdim <<= 1;
     long long tmax = 1;
-    for (long long t : cfg.tiws) tmax = std::max(tmax, t);
+    for (long long t : cfg.tiws)
+        tmax = std::max(tmax, t);
     int l = 0;
-    while ((1LL << l) < tmax) ++l;
+    while ((1LL << l) < tmax)
+        ++l;
     return zkmod_link::create(nb, 2LL * cfg.len * fdim, l + 1);
 }
-static bool link_end(const char *mode, bool all_ok) {
-    if (all_ok) all_ok = zkmod_link::all_checked(mode);
+static bool link_end(const char* mode, bool all_ok) {
+    if (all_ok)
+        all_ok = zkmod_link::all_checked(mode);
     zkmod_link::destroy();
     return all_ok;
 }
@@ -810,68 +677,58 @@ struct RunTotals {
     double makespan = 0;
 };
 
-static bool run_split_partitions(const SplitCfg &cfg, bool unique_parts, RunTotals &out) {
+static bool run_split_partitions(const SplitCfg& cfg, bool unique_parts, RunTotals& out) {
     SplitBlockCarryState carry;
     bool has_carry = false;
     double total_prover_time = 0.0;
     double total_output_commit_time = 0.0;
     double total_verifier_time = 0.0;
     double combined_proof_size_kb = 0.0;
-    // zkGPT's split baseline reports the PARALLEL makespan: max over partitions of prover_time,
-    // plus max over partitions of output_commit -- NOT the sum. We track both: the
-    // max (zkGPT-comparable) and the sum (single-GPU sequential wall-clock).
-    double max_prover_core   = 0.0;
+    // zkGPT's split baseline reports the PARALLEL makespan
+    double max_prover_core = 0.0;
     double max_output_commit = 0.0;
 
-    // ── which partitions to actually prove ──────────────────────────────────
-    // A partition's WORK is fixed by (role, split_depth) alone, so one representative
-    // of each pair suffices for a cost/VRAM measurement. MEASUREMENT MODE ONLY -- the
-    // carry chain skips the omitted blocks, so the last partition consumes a carry
-    // that is shape-correct and value-wrong. Do not publish a proof from this mode.
     std::vector<std::size_t> run_idx;
     if (unique_parts && cfg.nparts() > 3) {
         run_idx.push_back(0);
-        std::set<int> seen_mid;                       // one middle per distinct depth
+        std::set<int> seen_mid;  // one middle per distinct depth
         for (std::size_t i = 1; i + 1 < cfg.nparts(); ++i)
-            if (seen_mid.insert(cfg.split_depths[i]).second) run_idx.push_back(i);
+            if (seen_mid.insert(cfg.split_depths[i]).second)
+                run_idx.push_back(i);
         run_idx.push_back(cfg.nparts() - 1);
-        std::cerr << "[split] unique-parts: proving " << run_idx.size() << " of "
-                  << cfg.nparts() << " partitions (idx:";
-        for (auto i : run_idx) std::cerr << ' ' << i;
+        std::cerr << "[split] unique-parts: proving " << run_idx.size() << " of " << cfg.nparts()
+                  << " partitions (idx:";
+        for (auto i : run_idx)
+            std::cerr << ' ' << i;
         std::cerr << ") -- MEASUREMENT ONLY, proof is not end-to-end valid\n";
     } else {
-        for (std::size_t i = 0; i < cfg.nparts(); ++i) run_idx.push_back(i);
-        if (!link_begin(cfg)) return false;
+        for (std::size_t i = 0; i < cfg.nparts(); ++i)
+            run_idx.push_back(i);
+        if (!link_begin(cfg))
+            return false;
     }
-    std::cout << "SPLIT_MODE unique_parts=" << (unique_parts ? 1 : 0)
-              << " proved=" << run_idx.size()
+    std::cout << "SPLIT_MODE unique_parts=" << (unique_parts ? 1 : 0) << " proved=" << run_idx.size()
               << " of=" << cfg.nparts() << std::endl;
 
     for (std::size_t j = 0; j < run_idx.size(); ++j) {
         const std::size_t i = run_idx[j];
         const bool is_last = (i + 1 == cfg.nparts());
 
-        // Top of the iteration: the PREVIOUS PartitionState (and its prover) has
-        // already been destroyed, so this is the true between-partition floor.
+        // Top of the iteration
         memacct("floor", (long long)i);
 
         PartitionState st;
-        if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st)) return false;
+        if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st))
+            return false;
 
         if (cfg.witgen_only) {
-            // Report and move on -- no prove, no commit. A later run against the same
-            // ZKGPT_WITNESS_CACHE dir hits the cache and skips to proving, so wall
-            // time splits cleanly into "witgen" and "prove".
-            std::cout << "WITGEN_ONLY idx=" << i
-                      << " witgen_s=" << st.build_s
-                      << " witgen_fc_s=" << st.fc_s
+            std::cout << "WITGEN_ONLY idx=" << i << " witgen_s=" << st.build_s << " witgen_fc_s=" << st.fc_s
                       << " witgen_gates_s=" << st.gates_s
                       << " gpu_peak_mib=" << zkgpt_gpu::gkr_vram_peak_mib()
                       << " witgen_gpu_peak_mib=" << st.witgen_gpu_peak_mib
                       << " witgen_host_peak_mib=" << st.witgen_host_peak_mib
                       << " witgen_resident_mib=" << st.witgen_resident_mib
-                      << " witgen_h2d_gib=" << st.witgen_h2d_gib
-                      << " witgen_d2h_gib=" << st.witgen_d2h_gib
+                      << " witgen_h2d_gib=" << st.witgen_h2d_gib << " witgen_d2h_gib=" << st.witgen_d2h_gib
                       << std::endl;
             if (!is_last) {
                 SplitBlockCarryState next_carry = st.net->exportSplitBlockCarry(*st.p);
@@ -881,38 +738,43 @@ static bool run_split_partitions(const SplitCfg &cfg, bool unique_parts, RunTota
             continue;
         }
 
-        // Export before proving: prove mutates the prover, and upstream likewise
-        // snapshots the boundary from the built instance.
         SplitBlockCarryState next_carry;
-        if (!is_last) { ZKGPT_PHASE_SCOPE("export_carry");
-                        next_carry = st.net->exportSplitBlockCarry(*st.p); }
+        if (!is_last) {
+            ZKGPT_PHASE_SCOPE("export_carry");
+            next_carry = st.net->exportSplitBlockCarry(*st.p);
+        }
 
         PartResult res;
-        if (!prove_built_partition(cfg, i, st, res, cfg.num_threads)) return false;
+        if (!prove_built_partition(cfg, i, st, res, cfg.num_threads))
+            return false;
 
-        total_prover_time        += res.standalone_commit + res.prover_core + res.output_commit;
+        total_prover_time += res.standalone_commit + res.prover_core + res.output_commit;
         total_output_commit_time += res.output_commit;
-        total_verifier_time      += res.verifier;
-        combined_proof_size_kb   += res.proof_kb;
-        max_prover_core   = std::max(max_prover_core,
-                                     res.standalone_commit + res.prover_core);
+        total_verifier_time += res.verifier;
+        combined_proof_size_kb += res.proof_kb;
+        max_prover_core = std::max(max_prover_core, res.standalone_commit + res.prover_core);
         max_output_commit = std::max(max_output_commit, res.output_commit);
 
-        if (!is_last) { carry = std::move(next_carry); has_carry = true; }
+        if (!is_last) {
+            carry = std::move(next_carry);
+            has_carry = true;
+        }
     }
 
-    if (!link_end("sequential", true)) return false;
-    out.makespan          = max_prover_core + max_output_commit;
-    out.prover_sum        = total_prover_time;
+    if (!link_end("sequential", true))
+        return false;
+    out.makespan = max_prover_core + max_output_commit;
+    out.prover_sum = total_prover_time;
     out.output_commit_sum = total_output_commit_time;
-    out.verifier_sum      = total_verifier_time;
-    out.proof_kb          = combined_proof_size_kb;
+    out.verifier_sum = total_verifier_time;
+    out.proof_kb = combined_proof_size_kb;
     return true;
 }
 
-static bool run_split_sequential(SplitCfg &cfg, bool unique_parts) {
+static bool run_split_sequential(SplitCfg& cfg, bool unique_parts) {
     RunTotals grand;
-    if (!run_split_partitions(cfg, unique_parts, grand)) return false;
+    if (!run_split_partitions(cfg, unique_parts, grand))
+        return false;
 
     std::cout << "Split proof results:" << std::endl;
     std::cout << "  Output commit time: " << grand.output_commit_sum << " s" << std::endl;
@@ -920,28 +782,20 @@ static bool run_split_sequential(SplitCfg &cfg, bool unique_parts) {
     std::cout << "  Prover time (single-GPU sequential, sum):    " << grand.prover_sum << " s" << std::endl;
     std::cout << "  Total verifier time:" << grand.verifier_sum << " s" << std::endl;
     std::cout << "  Combined proof size:" << grand.proof_kb << " KB" << std::endl;
-    std::cout << "SPLIT_SUMMARY makespan_s=" << grand.makespan
-              << " seq_sum_s=" << grand.prover_sum
-              << " output_commit_s=" << grand.output_commit_sum
-              << " parts=" << cfg.nparts()
-              << " len=" << cfg.len
-              << " verifier_s=" << grand.verifier_sum
-              << " proof_kb=" << grand.proof_kb << std::endl;
+    std::cout << "SPLIT_SUMMARY makespan_s=" << grand.makespan << " seq_sum_s=" << grand.prover_sum
+              << " output_commit_s=" << grand.output_commit_sum << " parts=" << cfg.nparts()
+              << " len=" << cfg.len << " verifier_s=" << grand.verifier_sum << " proof_kb=" << grand.proof_kb
+              << std::endl;
     return true;
 }
 
-// --concurrent: fork-and-hold. The parent walks the carry chain, forking a child
-// after each build; children block until every sibling exists, so all N start at
-// once and the wall clock is a makespan.
-// The parent MUST NOT touch the GPU before forking -- a HIP context and the sampler
-// thread do not survive fork(). gkr_vram_peak_start() is left to the children.
-static bool run_split_concurrent(const SplitCfg &cfg, int width) {
+// concurrent: fork-and-hold
+static bool run_split_concurrent(const SplitCfg& cfg, int width) {
     const int n = static_cast<int>(cfg.nparts());
     const int w = (width > 0 && width < n) ? width : n;
 
     const int nwaves = (n + w - 1) / w;
-    // One host thread budget split across the concurrent children. Giving each child the full count made the
-    // concurrent path use W times the CPU of the sequential path.
+    // One host thread budget split across the concurrent children
     const int tpc = std::max(1, cfg.num_threads / w);
     core_table_init(tpc);
 
@@ -949,21 +803,19 @@ static bool run_split_concurrent(const SplitCfg &cfg, int width) {
     bool has_carry = false;
     bool all_ok = true;
     double makespan_s = 0.0;
-    const pid_t sampler = cfg.vram_csv.empty()
-        ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
+    const pid_t sampler =
+        cfg.vram_csv.empty() ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
 
-    // One release gate per wave, all created before any fork so a child can close
-    // every gate it does not belong to. If a wave-0 child kept wave 1's write end
-    // open, wave 1 would not see EOF until that child exited.
+    // One release gate per wave
     std::vector<std::array<int, 2>> gates(nwaves);
     for (int g = 0; g < nwaves; ++g)
-        if (pipe(gates[g].data()) != 0) { std::perror("[split] pipe"); return false; }
-    if (!link_begin(cfg)) return false;
+        if (pipe(gates[g].data()) != 0) {
+            std::perror("[split] pipe");
+            return false;
+        }
+    if (!link_begin(cfg))
+        return false;
 
-    // ── build every partition and fork its child up front ───────────────────
-    // Children block on their wave's gate, so a not-yet-released child costs almost
-    // nothing: its pages are all still shared with the parent. Building ahead is what
-    // keeps the inter-wave gap from containing a whole wave's worth of circuit builds.
     std::vector<std::vector<pid_t>> wave_pids(nwaves);
     const double t_prep0 = prof_now_us();
     for (int i = 0; i < n && all_ok; ++i) {
@@ -971,36 +823,39 @@ static bool run_split_concurrent(const SplitCfg &cfg, int width) {
         const int my_wave = i / w;
 
         PartitionState st;
-        if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st)) { all_ok = false; break; }
+        if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st)) {
+            all_ok = false;
+            break;
+        }
         SplitBlockCarryState next_carry;
-        if (!is_last) { ZKGPT_PHASE_SCOPE("export_carry");
-                        next_carry = st.net->exportSplitBlockCarry(*st.p); }
+        if (!is_last) {
+            ZKGPT_PHASE_SCOPE("export_carry");
+            next_carry = st.net->exportSplitBlockCarry(*st.p);
+        }
 
-        // Drain our stdio buffers first, or every child inherits a copy and re-emits
-        // whatever is still sitting in them.
         std::cout.flush();
         std::cerr.flush();
         pid_t pid = fork();
         if (pid == 0) {
-            // Die with the parent, or a killed run leaves orphans holding GPU memory.
-            // The getppid() recheck closes the race where the parent dies first.
+            // Die with the parent, or a killed run leaves orphans holding GPU memory
             prctl(PR_SET_PDEATHSIG, SIGTERM);
-            if (getppid() == 1) _exit(1);
+            if (getppid() == 1)
+                _exit(1);
             child_threads_set(tpc);
             for (int g = 0; g < nwaves; ++g) {
                 close(gates[g][1]);
-                if (g != my_wave) close(gates[g][0]);
+                if (g != my_wave)
+                    close(gates[g][0]);
             }
-            // Drop what only the parent needs. These pages are still shared, so
-            // freeing them costs nothing and stops the parent's later builds from
-            // copy-on-write duplicating them into this child.
+            // Drop what only the parent needs
             carry.input_data = std::vector<F>();
             next_carry.input_data = std::vector<F>();
 
             {
                 ZKGPT_PHASE_SCOPE("gate_wait");
                 char go = 0;
-                while (read(gates[my_wave][0], &go, 1) < 0 && errno == EINTR) {}
+                while (read(gates[my_wave][0], &go, 1) < 0 && errno == EINTR) {
+                }
                 close(gates[my_wave][0]);
             }
             pin_child_cores(i);
@@ -1016,30 +871,43 @@ static bool run_split_concurrent(const SplitCfg &cfg, int width) {
             std::cout.flush();
             _exit(ok ? 0 : 1);
         }
-        if (pid < 0) { std::perror("[split] fork"); all_ok = false; break; }
+        if (pid < 0) {
+            std::perror("[split] fork");
+            all_ok = false;
+            break;
+        }
         wave_pids[my_wave].push_back(pid);
 
         st.p.reset();
         st.net.reset();
-        if (!is_last) { carry = std::move(next_carry); has_carry = true; }
-        std::cerr << "[split] built+forked " << (i + 1) << "/" << n
-                  << " wave " << my_wave << " (pid " << pid << ")\n";
+        if (!is_last) {
+            carry = std::move(next_carry);
+            has_carry = true;
+        }
+        std::cerr << "[split] built+forked " << (i + 1) << "/" << n << " wave " << my_wave << " (pid " << pid
+                  << ")\n";
     }
     const double prep_s = (prof_now_us() - t_prep0) / 1e6;
-    carry.input_data = std::vector<F>();          // parent is done with the chain
-    for (int g = 0; g < nwaves; ++g) close(gates[g][0]);   // parent never reads
+    carry.input_data = std::vector<F>();  // parent is done with the chain
+    for (int g = 0; g < nwaves; ++g)
+        close(gates[g][0]);  // parent never reads
 
-    // ── release wave by wave ────────────────────────────────────────────────
+    // release wave by wave
     double first_release_us = 0, last_join_us = 0;
     zkgpt_phase::set_part(-1);
     for (int g = 0; g < nwaves && all_ok; ++g) {
         const double t_rel = prof_now_us();
-        if (g == 0) first_release_us = t_rel;
+        if (g == 0)
+            first_release_us = t_rel;
         ZKGPT_PHASE_MARKF("release_wave%d", g);
-        close(gates[g][1]);                        // EOF == go
+        close(gates[g][1]);  // EOF == go
         for (pid_t pid : wave_pids[g]) {
             int stt = 0;
-            if (waitpid(pid, &stt, 0) < 0) { std::perror("[split] waitpid"); all_ok = false; continue; }
+            if (waitpid(pid, &stt, 0) < 0) {
+                std::perror("[split] waitpid");
+                all_ok = false;
+                continue;
+            }
             if (!WIFEXITED(stt) || WEXITSTATUS(stt) != 0) {
                 std::cerr << "[split] child pid " << pid << " failed (status " << stt << ")\n";
                 all_ok = false;
@@ -1049,55 +917,50 @@ static bool run_split_concurrent(const SplitCfg &cfg, int width) {
         ZKGPT_PHASE_MARKF("joined_wave%d", g);
         makespan_s += (last_join_us - t_rel) / 1e6;
     }
-    // Reap anything still outstanding after an early failure, so a bad run cannot
-    // leave orphaned children holding GPU memory.
+    // Reap anything still outstanding after an early failure
     if (!all_ok)
         for (int g = 0; g < nwaves; ++g) {
             close(gates[g][1]);
-            for (pid_t pid : wave_pids[g]) { int stt = 0; waitpid(pid, &stt, WNOHANG); }
+            for (pid_t pid : wave_pids[g]) {
+                int stt = 0;
+                waitpid(pid, &stt, WNOHANG);
+            }
         }
 
     zkgpt_sampler::stop(sampler);
     report_vram_peak(cfg, first_release_us, last_join_us, "concurrent");
     all_ok = link_end("concurrent", all_ok);
 
-    // No aggregate proof_kb/verifier_s: those live in the children's PARTITION lines,
-    // and summing them here would invent numbers if a child died. all_ok is the gate.
-    std::cout << "SPLIT_CONCURRENT parts=" << n
-              << " width=" << w
-              << " waves=" << nwaves
-              << " threads_per_child=" << tpc
-              << " threads_total=" << cfg.num_threads
-              << " prep_s=" << prep_s
-              << " concurrent_makespan_s=" << makespan_s
-              << " status=" << (all_ok ? "OK" : "FAIL") << std::endl;
+    // No aggregate proof_kb/verifier_s
+    std::cout << "SPLIT_CONCURRENT parts=" << n << " width=" << w << " waves=" << nwaves
+              << " threads_per_child=" << tpc << " threads_total=" << cfg.num_threads << " prep_s=" << prep_s
+              << " concurrent_makespan_s=" << makespan_s << " status=" << (all_ok ? "OK" : "FAIL")
+              << std::endl;
     return all_ok;
 }
 
-// ── --batched: build(batch b+1) overlapped onto prove(batch b) ─────────────
-// Builds are serial: build_partition(i+1) consumes exportSplitBlockCarry(i). No build
-// depends on a PROOF, so only the build/prove axis can overlap, not builds with each
-// other. Parent must reach fork() with no HIP context (see run_split_concurrent).
-static bool run_split_batched(const SplitCfg &cfg, int batch) {
+static bool run_split_batched(const SplitCfg& cfg, int batch) {
     const int n = static_cast<int>(cfg.nparts());
     const int b = (batch > 0 && batch < n) ? batch : n;
     const int nb = (n + b - 1) / b;
-    // Parent's build is not given a slice of this budget.
+    // Parent's build is not given a slice of this budget
     const int tpc = std::max(1, cfg.num_threads / b);
     core_table_init(tpc);
 
     SplitBlockCarryState carry;
     bool has_carry = false;
     bool all_ok = true;
-    const pid_t sampler = cfg.vram_csv.empty()
-        ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
+    const pid_t sampler =
+        cfg.vram_csv.empty() ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
 
-    // All gates created before any fork so a child can close every gate it is not in;
-    // a batch-0 child holding batch 2's write end would stop batch 2 seeing EOF.
     std::vector<std::array<int, 2>> gates(nb);
     for (int g = 0; g < nb; ++g)
-        if (pipe(gates[g].data()) != 0) { std::perror("[split] pipe"); return false; }
-    if (!link_begin(cfg)) return false;
+        if (pipe(gates[g].data()) != 0) {
+            std::perror("[split] pipe");
+            return false;
+        }
+    if (!link_begin(cfg))
+        return false;
 
     std::vector<std::vector<pid_t>> batch_pids(nb);
     std::vector<double> build_s(nb, 0.0), join_wait_s(nb, 0.0);
@@ -1109,21 +972,26 @@ static bool run_split_batched(const SplitCfg &cfg, int batch) {
             const bool is_last = (i + 1 == n);
 
             PartitionState st;
-            if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st)) return false;
+            if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st))
+                return false;
             SplitBlockCarryState next_carry;
-            if (!is_last) { ZKGPT_PHASE_SCOPE("export_carry");
-                            next_carry = st.net->exportSplitBlockCarry(*st.p); }
+            if (!is_last) {
+                ZKGPT_PHASE_SCOPE("export_carry");
+                next_carry = st.net->exportSplitBlockCarry(*st.p);
+            }
 
             std::cout.flush();
             std::cerr.flush();
             pid_t pid = fork();
             if (pid == 0) {
                 prctl(PR_SET_PDEATHSIG, SIGTERM);
-                if (getppid() == 1) _exit(1);
+                if (getppid() == 1)
+                    _exit(1);
                 child_threads_set(tpc);
                 for (int q = 0; q < nb; ++q) {
                     close(gates[q][1]);
-                    if (q != g) close(gates[q][0]);
+                    if (q != g)
+                        close(gates[q][0]);
                 }
                 carry.input_data = std::vector<F>();
                 next_carry.input_data = std::vector<F>();
@@ -1131,7 +999,8 @@ static bool run_split_batched(const SplitCfg &cfg, int batch) {
                 {
                     ZKGPT_PHASE_SCOPE("gate_wait");
                     char go = 0;
-                    while (read(gates[g][0], &go, 1) < 0 && errno == EINTR) {}
+                    while (read(gates[g][0], &go, 1) < 0 && errno == EINTR) {
+                    }
                     close(gates[g][0]);
                 }
                 pin_child_cores(i);
@@ -1147,14 +1016,20 @@ static bool run_split_batched(const SplitCfg &cfg, int batch) {
                 std::cout.flush();
                 _exit(ok ? 0 : 1);
             }
-            if (pid < 0) { std::perror("[split] fork"); return false; }
+            if (pid < 0) {
+                std::perror("[split] fork");
+                return false;
+            }
             batch_pids[g].push_back(pid);
 
             st.p.reset();
             st.net.reset();
-            if (!is_last) { carry = std::move(next_carry); has_carry = true; }
-            std::cerr << "[split] built+forked " << (i + 1) << "/" << n
-                      << " batch " << g << " (pid " << pid << ")\n";
+            if (!is_last) {
+                carry = std::move(next_carry);
+                has_carry = true;
+            }
+            std::cerr << "[split] built+forked " << (i + 1) << "/" << n << " batch " << g << " (pid " << pid
+                      << ")\n";
         }
         build_s[g] = (prof_now_us() - t_b0) / 1e6;
         return true;
@@ -1162,23 +1037,32 @@ static bool run_split_batched(const SplitCfg &cfg, int batch) {
 
     const double t0 = prof_now_us();
 
-    if (!build_batch(0)) all_ok = false;
+    if (!build_batch(0))
+        all_ok = false;
     const double exposed_build_s = build_s[0];
 
     double first_release_us = 0, last_join_us = 0;
     for (int g = 0; g < nb && all_ok; ++g) {
         const double t_rel = prof_now_us();
-        if (g == 0) first_release_us = t_rel;
+        if (g == 0)
+            first_release_us = t_rel;
         zkgpt_phase::set_part(-1);
         ZKGPT_PHASE_MARKF("release_batch%d", g);
-        close(gates[g][1]);                        // EOF == go, batch g starts proving
+        close(gates[g][1]);  // EOF == go, batch g starts proving
 
-        if (g + 1 < nb && !build_batch(g + 1)) { all_ok = false; break; }   // the overlap
+        if (g + 1 < nb && !build_batch(g + 1)) {
+            all_ok = false;
+            break;
+        }  // the overlap
 
         const double t_join0 = prof_now_us();
         for (pid_t pid : batch_pids[g]) {
             int stt = 0;
-            if (waitpid(pid, &stt, 0) < 0) { std::perror("[split] waitpid"); all_ok = false; continue; }
+            if (waitpid(pid, &stt, 0) < 0) {
+                std::perror("[split] waitpid");
+                all_ok = false;
+                continue;
+            }
             if (!WIFEXITED(stt) || WEXITSTATUS(stt) != 0) {
                 std::cerr << "[split] child pid " << pid << " failed (status " << stt << ")\n";
                 all_ok = false;
@@ -1188,25 +1072,27 @@ static bool run_split_batched(const SplitCfg &cfg, int batch) {
         zkgpt_phase::set_part(-1);
         ZKGPT_PHASE_MARKF("joined_batch%d", g);
         join_wait_s[g] = (last_join_us - t_join0) / 1e6;
-        std::cout << "BATCHED_GROUP g=" << g
-                  << " lo=" << (g * b) << " hi=" << std::min(n, (g + 1) * b)
-                  << " build_s=" << build_s[g]
-                  << " next_build_s=" << (g + 1 < nb ? build_s[g + 1] : 0.0)
-                  << " join_wait_s=" << join_wait_s[g]
-                  // join_wait ~0 means the children were already done when the
-                  // parent finished building, i.e. the BUILD held the critical path.
-                  << " bottleneck=" << (g + 1 >= nb ? "exposed-prove"
-                                        : (join_wait_s[g] > 1.0 ? "prove" : "build"))
+        std::cout << "BATCHED_GROUP g=" << g << " lo=" << (g * b) << " hi=" << std::min(n, (g + 1) * b)
+                  << " build_s=" << build_s[g] << " next_build_s=" << (g + 1 < nb ? build_s[g + 1] : 0.0)
+                  << " join_wait_s="
+                  << join_wait_s[g]
+                  // join_wait ~0 means the children were already done when the parent finished building
+                  << " bottleneck="
+                  << (g + 1 >= nb ? "exposed-prove" : (join_wait_s[g] > 1.0 ? "prove" : "build"))
                   << std::endl;
     }
     const double total_s = (prof_now_us() - t0) / 1e6;
     carry.input_data = std::vector<F>();
-    for (int g = 0; g < nb; ++g) close(gates[g][0]);   // parent never reads
+    for (int g = 0; g < nb; ++g)
+        close(gates[g][0]);  // parent never reads
 
     if (!all_ok)
         for (int g = 0; g < nb; ++g) {
             close(gates[g][1]);
-            for (pid_t pid : batch_pids[g]) { int stt = 0; waitpid(pid, &stt, WNOHANG); }
+            for (pid_t pid : batch_pids[g]) {
+                int stt = 0;
+                waitpid(pid, &stt, WNOHANG);
+            }
         }
 
     zkgpt_sampler::stop(sampler);
@@ -1214,224 +1100,217 @@ static bool run_split_batched(const SplitCfg &cfg, int batch) {
     all_ok = link_end("batched", all_ok);
 
     double build_sum_s = 0;
-    for (double v : build_s) build_sum_s += v;
+    for (double v : build_s)
+        build_sum_s += v;
 
-    // batched_total_s INCLUDES witgen; builds and proving interleave, so unlike
-    // --concurrent's prep_s/makespan_s they cannot be reported disjointly.
-    std::cout << "SPLIT_BATCHED parts=" << n
-              << " batch=" << b
-              << " batches=" << nb
-              << " threads_per_child=" << tpc
-              << " threads_total=" << cfg.num_threads
-              << " build_sum_s=" << build_sum_s
-              << " exposed_build_s=" << exposed_build_s
-              << " batched_total_s=" << total_s
-              << " status=" << (all_ok ? "OK" : "FAIL") << std::endl;
+    // batched_total_s INCLUDES witgen
+    std::cout << "SPLIT_BATCHED parts=" << n << " batch=" << b << " batches=" << nb
+              << " threads_per_child=" << tpc << " threads_total=" << cfg.num_threads
+              << " build_sum_s=" << build_sum_s << " exposed_build_s=" << exposed_build_s
+              << " batched_total_s=" << total_s << " status=" << (all_ok ? "OK" : "FAIL") << std::endl;
     return all_ok;
 }
 
-// --overlapped: fork before any HIP, children do their own GPU witgen. The parent's
-// probe pass runs with witgen_gpu=false, so every child forks HIP-free and may init
-// HIP itself -- which is what lets witgen run on GPU at all.
-// The carry chain stays serial (build i+1 needs exportSplitBlockCarry(i)), handed
-// child-to-child through one MAP_SHARED buffer; one suffices because child i+1 copies
-// it out before its own witgen and child i+2 is still gated.
-// Proving concurrency is capped by a token pipe pre-loaded with `batch` bytes. Every
-// field initStateFromCarry() reads must cross, not just input_data: len/feature_dim
-// left at 0 give LLONG_MIN offsets in initParam and a garbage circuit.
+// overlapped: fork before any HIP, children do their own GPU witgen
 struct ChainShm {
-    unsigned long long count;      // elements in data[]
+    unsigned long long count;  // elements in data[]
     long long input_offset, len, feature_dim;
     int input_c, input_e;
-    F data[1];                     // [cap] elements follow
+    F data[1];  // [cap] elements follow
 };
 
-// `barrier`: hold every child at a gate until the last finishes witgen, then
-// release together -- serial w.r.t. witgen, proving still concurrent.
-// Host MemAvailable, in KiB, from /proc/meminfo (0 on any read failure -- callers
-// treat that as "don't know, don't release" rather than crashing the run).
-// Headroom, in KiB, under the tightest cgroup-v2 memory.max on the path from our cgroup to the
-// root (a Slurm job on a shared node: MemAvailable is the whole node's, the job is capped far
-// below it). Usage = memory.current minus inactive_file, the cache the kernel reclaims before an
-// OOM kill, as MemAvailable counts it. -1 when no limit is set or cgroup v2 is not mounted.
 static long long cgroup_available_kib() {
-    FILE *f = fopen("/proc/self/cgroup", "r");
-    if (!f) return -1;
+    FILE* f = fopen("/proc/self/cgroup", "r");
+    if (!f)
+        return -1;
     char line[4096], rel[4096] = "";
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "0::%4095s", rel) == 1) break;
+        if (sscanf(line, "0::%4095s", rel) == 1)
+            break;
     }
     fclose(f);
-    if (!rel[0]) return -1;
+    if (!rel[0])
+        return -1;
     std::string dir = std::string("/sys/fs/cgroup") + (std::strcmp(rel, "/") ? rel : "");
     long long best = -1;
     for (;;) {
         long long max_b = -1, cur_b = -1, inactive_b = 0;
-        if (FILE *m = fopen((dir + "/memory.max").c_str(), "r")) {
-            if (fscanf(m, "%lld", &max_b) != 1) max_b = -1;   // "max" = no limit at this level
+        if (FILE* m = fopen((dir + "/memory.max").c_str(), "r")) {
+            if (fscanf(m, "%lld", &max_b) != 1)
+                max_b = -1;  // "max" = no limit at this level
             fclose(m);
         }
         if (max_b >= 0) {
-            if (FILE *c = fopen((dir + "/memory.current").c_str(), "r")) {
-                if (fscanf(c, "%lld", &cur_b) != 1) cur_b = -1;
+            if (FILE* c = fopen((dir + "/memory.current").c_str(), "r")) {
+                if (fscanf(c, "%lld", &cur_b) != 1)
+                    cur_b = -1;
                 fclose(c);
             }
-            if (FILE *s = fopen((dir + "/memory.stat").c_str(), "r")) {
+            if (FILE* s = fopen((dir + "/memory.stat").c_str(), "r")) {
                 while (fgets(line, sizeof line, s)) {
-                    if (sscanf(line, "inactive_file %lld", &inactive_b) == 1) break;
+                    if (sscanf(line, "inactive_file %lld", &inactive_b) == 1)
+                        break;
                 }
                 fclose(s);
             }
             if (cur_b >= 0) {
                 long long kib = (max_b - std::max(0LL, cur_b - inactive_b)) / 1024;
-                if (kib < 0) kib = 0;
-                if (best < 0 || kib < best) best = kib;
+                if (kib < 0)
+                    kib = 0;
+                if (best < 0 || kib < best)
+                    best = kib;
             }
         }
-        if (dir == "/sys/fs/cgroup") break;
+        if (dir == "/sys/fs/cgroup")
+            break;
         dir.erase(dir.rfind('/'));
     }
     return best;
 }
 
 static long long mem_available_kib() {
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f)
+        return 0;
     char line[256];
     long long kib = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1) break;
+        if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1)
+            break;
     }
     fclose(f);
     const long long cg = cgroup_available_kib();
     return cg >= 0 && cg < kib ? cg : kib;
 }
 
-// A child's high-water RSS (VmHWM, KiB) from /proc -- the memory-gated release
-// loop uses it as "how much of its eventual peak has this partition already
-// claimed". 0 if the process is gone or unreadable.
+// A child's high-water RSS (VmHWM, KiB) from /proc
 static long long proc_hwm_kib(pid_t pid) {
     char path[64];
     std::snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    FILE* f = fopen(path, "r");
+    if (!f)
+        return 0;
     char line[256];
     long long kib = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "VmHWM: %lld kB", &kib) == 1) break;
+        if (sscanf(line, "VmHWM: %lld kB", &kib) == 1)
+            break;
     }
     fclose(f);
     return kib;
 }
 
-// A child's CURRENT resident set (VmRSS, KiB); 0 if gone. The witgen cap adds our own
-// children's usage back onto MemAvailable to size the box for our partitions alone.
+// A child's CURRENT resident set (VmRSS, KiB)
 static long long proc_rss_kib(pid_t pid) {
     char path[64];
     std::snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    FILE* f = fopen(path, "r");
+    if (!f)
+        return 0;
     char line[256];
     long long kib = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "VmRSS: %lld kB", &kib) == 1) break;
+        if (sscanf(line, "VmRSS: %lld kB", &kib) == 1)
+            break;
     }
     fclose(f);
     return kib;
 }
 
-// VRAM side of the memory gate. The parent has no HIP context (children must
-// initialise HIP after fork), so it reads the amdgpu/KFD sysfs instead: the
-// device's total/used VRAM (all processes, other users included) and each
-// child's own VRAM from /sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>. HIP device
-// k is the k-th GPU node in KFD topology order (CPU nodes report gpu_id 0).
-struct VramDev { long long gpu_id = 0; std::string drm; };
-static long long read_ll(const std::string &path) {
-    FILE *f = fopen(path.c_str(), "r");
-    if (!f) return -1;
+// VRAM side of the memory gate
+struct VramDev {
+    long long gpu_id = 0;
+    std::string drm;
+};
+static long long read_ll(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f)
+        return -1;
     long long v = -1;
-    if (fscanf(f, "%lld", &v) != 1) v = -1;
+    if (fscanf(f, "%lld", &v) != 1)
+        v = -1;
     fclose(f);
     return v;
 }
-static bool vram_dev_for_hip_index(int k, VramDev &d) {
+static bool vram_dev_for_hip_index(int k, VramDev& d) {
     const std::string base = "/sys/class/kfd/kfd/topology/nodes/";
     int seen = 0;
     for (int node = 0; node < 64; ++node) {
         const long long id = read_ll(base + std::to_string(node) + "/gpu_id");
-        if (id < 0) break;
-        if (id == 0) continue;
-        if (seen++ != k) continue;
-        FILE *f = fopen((base + std::to_string(node) + "/properties").c_str(), "r");
-        if (!f) return false;
-        char key[128]; long long val; int minor = -1;
+        if (id < 0)
+            break;
+        if (id == 0)
+            continue;
+        if (seen++ != k)
+            continue;
+        FILE* f = fopen((base + std::to_string(node) + "/properties").c_str(), "r");
+        if (!f)
+            return false;
+        char key[128];
+        long long val;
+        int minor = -1;
         while (fscanf(f, "%127s %lld", key, &val) == 2)
-            if (!strcmp(key, "drm_render_minor")) minor = (int)val;
+            if (!strcmp(key, "drm_render_minor"))
+                minor = (int)val;
         fclose(f);
-        if (minor < 0) return false;
+        if (minor < 0)
+            return false;
         d.gpu_id = id;
         d.drm = "/sys/class/drm/renderD" + std::to_string(minor) + "/device/";
         return read_ll(d.drm + "mem_info_vram_total") > 0;
     }
     return false;
 }
-static long long vram_free_kib(const VramDev &d) {
+static long long vram_free_kib(const VramDev& d) {
     const long long t = read_ll(d.drm + "mem_info_vram_total");
     const long long u = read_ll(d.drm + "mem_info_vram_used");
     return (t < 0 || u < 0) ? -1 : (t - u) / 1024;
 }
-static long long proc_vram_kib(pid_t pid, const VramDev &d) {
-    const long long b = read_ll("/sys/class/kfd/kfd/proc/" + std::to_string((int)pid)
-                                + "/vram_" + std::to_string(d.gpu_id));
+static long long proc_vram_kib(pid_t pid, const VramDev& d) {
+    const long long b =
+        read_ll("/sys/class/kfd/kfd/proc/" + std::to_string((int)pid) + "/vram_" + std::to_string(d.gpu_id));
     return b < 0 ? 0 : b / 1024;
 }
 
-// child -> parent event in memory-gated mode (one record per transition; the
-// pipe write is well under PIPE_BUF so it is atomic).
-struct ChainStat { char ev; int idx; };
+// child -> parent event in memory-gated mode
+struct ChainStat {
+    char ev;
+    int idx;
+};
 
-// Deletes partition idx's witness-cache file(s) ("..._p<idx>_<hash>.bin") from dir.
-static void remove_part_files(const std::string &dir, int idx) {
-    DIR *d = opendir(dir.c_str());
-    if (!d) return;
+// Deletes partition idx's witness-cache file(s) ("..._p<idx>_<hash>.bin") from dir
+static void remove_part_files(const std::string& dir, int idx) {
+    DIR* d = opendir(dir.c_str());
+    if (!d)
+        return;
     const std::string tag = "_p" + std::to_string(idx) + "_";
-    while (dirent *e = readdir(d))
+    while (dirent* e = readdir(d))
         if (std::strstr(e->d_name, tag.c_str()))
             ::unlink((dir + "/" + e->d_name).c_str());
     closedir(d);
 }
 
-static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witgen_gpu,
-                                 bool want_round_gpu, bool want_gates_gpu,
-                                 bool want_witgen_full, bool barrier) {
+static bool run_split_overlapped(const SplitCfg& cfg, int batch, bool want_witgen_gpu, bool want_round_gpu,
+                                 bool want_gates_gpu, bool want_witgen_full, bool barrier) {
     const int n = static_cast<int>(cfg.nparts());
-    // batch < 0: memory-gated mode -- releases build/proving slots as
-    // MemAvailable allows (see the release loop below) instead of a fixed
-    // concurrency cap; tpc still divides across all n like the untied (b=n) case.
+    // batch < 0: memory-gated mode
     const bool mem_gated = (batch < 0);
     const int b = mem_gated ? n : (batch > 0 && batch < n) ? batch : n;
-    // GKR_TPC: threads per child, overriding num_threads/b. Meant for memory-
-    // gated mode, where b==n makes the default divide the budget across ALL
-    // partitions although memory only ever admits a few at once (opt2b7 at
-    // splits=16: 12 threads each for a run that fits ~2 provers).
+    // GKR_TPC: threads per child, overriding num_threads/b
     int tpc = std::max(1, cfg.num_threads / b);
-    if (const char *e = getenv("GKR_TPC")) { int v = atoi(e); if (v > 0) tpc = v; }
-    // One pool: no child gets more than the whole budget, and (mem-gated) the gate below never
-    // admits more children than the pool holds -- at most num_threads / tpc alive at once.
+    if (const char* e = getenv("GKR_TPC")) {
+        int v = atoi(e);
+        if (v > 0)
+            tpc = v;
+    }
     tpc = std::min(tpc, std::max(1, cfg.num_threads));
     core_table_init(tpc);
 
-    // The carry is val[0] = input witness PLUS the model weight region, so it is
-    // strictly larger than tiws (measured 1069.9 vs 1024 MiB on GPT-2). No cheap exact
-    // bound exists without building, so over-allocate and keep the hard check below --
-    // the mapping is lazily faulted, so untouched pages cost nothing.
     long long cap = 0;
-    for (long long t : cfg.tiws) cap = std::max(cap, t);
+    for (long long t : cfg.tiws)
+        cap = std::max(cap, t);
     if (cap <= 0) {
-        // Defensive: the probe always sets tiws > 0. The carry is the
-        // len*channel_out activation slice (exportSplitBlockCarry); only the
-        // whole-val[0] fallback there is bigger, and the hard check below still
-        // catches that. Mapping is lazily faulted, so be generous.
+        // Defensive: the probe always sets tiws > 0
         const long long slice = 1LL * cfg.len * (1LL << ceilPow2BitLength(cfg.embed_size));
         cap = std::max(1LL << 26, 8 * slice);
         std::cerr << "[split] witgen-chain: no probed layout, carry cap " << cap << " elems\n";
@@ -1439,128 +1318,134 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
     cap = cap * 2;
     const std::size_t shm_bytes = sizeof(ChainShm) + (std::size_t)cap * sizeof(F);
 
-    void *raw = mmap(nullptr, shm_bytes, PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (raw == MAP_FAILED) { std::perror("[split] mmap"); return false; }
-    ChainShm *shm = static_cast<ChainShm *>(raw);
+    void* raw = mmap(nullptr, shm_bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        std::perror("[split] mmap");
+        return false;
+    }
+    ChainShm* shm = static_cast<ChainShm*>(raw);
     shm->count = 0;
-    if (!link_begin(cfg)) { munmap(raw, shm_bytes); return false; }
-    std::cerr << "[split] witgen-chain carry buffer " << (shm_bytes / 1048576.0)
-              << " MiB (cap " << cap << " elems)\n";
+    if (!link_begin(cfg)) {
+        munmap(raw, shm_bytes);
+        return false;
+    }
+    std::cerr << "[split] witgen-chain carry buffer " << (shm_bytes / 1048576.0) << " MiB (cap " << cap
+              << " elems)\n";
 
-    // START THE SAMPLER BEFORE ANY PIPE EXISTS. It is a fork, so it inherits every fd
-    // open at that moment; `allgate` below signals release by EOF, which only happens
-    // once EVERY write end is closed. A sampler forked after the pipes holds allgate[1]
-    // open for the life of the run and the barrier can never release -- all children
-    // block in barrier_wait, the parent blocks in waitpid, and nothing is logged.
-    // Needs --vram-csv and --witgen-barrier together to trigger.
-    const pid_t sampler = cfg.vram_csv.empty()
-        ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
+    // START THE SAMPLER BEFORE ANY PIPE EXISTS. It is a fork
+    const pid_t sampler =
+        cfg.vram_csv.empty() ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
 
-    // gates[i]: child i signals it has published its carry; child i+1 waits on it.
+    // gates[i]: child i signals it has published its carry
     std::vector<std::array<int, 2>> gates(n > 1 ? n - 1 : 0);
-    for (auto &g : gates)
-        if (pipe(g.data()) != 0) { std::perror("[split] pipe"); munmap(raw, shm_bytes); return false; }
-    // started[i]: child i has its build slot (or, ungated, has begun building). Child
-    // i+1 PREBUILDS -- takes a build slot and does everything that does not read the
-    // carry (layout, weights, input layer) -- only after this, so at most one child
-    // ever waits for a build slot and the slots go out in chain order: a child
-    // holding a slot while it waits for its carry always has a predecessor that holds
-    // one too and is making progress. The slot charges the full build estimate, so
-    // the memory gate sees the prebuild's allocations. GKR_PREBUILD=0 turns it off.
-    // Not with the witness cache: a hit skips create() and with it the carry hook.
-    const bool prebuild_on = !(getenv("GKR_PREBUILD") && !strcmp(getenv("GKR_PREBUILD"), "0"))
-                             && !zkgpt_wc::enabled();
+    for (auto& g : gates)
+        if (pipe(g.data()) != 0) {
+            std::perror("[split] pipe");
+            munmap(raw, shm_bytes);
+            return false;
+        }
+    // started[i]: child i has its build slot (or, ungated, has begun building)
+    const bool prebuild_on =
+        !(getenv("GKR_PREBUILD") && !strcmp(getenv("GKR_PREBUILD"), "0")) && !zkgpt_wc::enabled();
     std::vector<std::array<int, 2>> started(n > 1 ? n - 1 : 0);
-    for (auto &g : started)
-        if (pipe(g.data()) != 0) { std::perror("[split] pipe"); munmap(raw, shm_bytes); return false; }
+    for (auto& g : started)
+        if (pipe(g.data()) != 0) {
+            std::perror("[split] pipe");
+            munmap(raw, shm_bytes);
+            return false;
+        }
 
-    // allgate: parent closes the write end at last build -> EOF broadcast.
-    // notify: last child -> parent, "all witgen complete".
     int allgate[2] = {-1, -1}, notify[2] = {-1, -1};
     if (barrier && (pipe(allgate) != 0 || pipe(notify) != 0)) {
-        std::perror("[split] pipe"); munmap(raw, shm_bytes); return false;
+        std::perror("[split] pipe");
+        munmap(raw, shm_bytes);
+        return false;
     }
     int tok[2];
-    if (pipe(tok) != 0) { std::perror("[split] pipe"); munmap(raw, shm_bytes); return false; }
-    // Memory-gated mode preloads NO tokens: every proving slot, the first one
-    // included, is issued by the release loop below (a preloaded token would let
-    // the parent's bookkeeping run ahead of reality). Fixed-batch mode: all b
-    // tokens exist from the start.
+    if (pipe(tok) != 0) {
+        std::perror("[split] pipe");
+        munmap(raw, shm_bytes);
+        return false;
+    }
+    // Memory-gated mode preloads NO tokens
     for (int i = 0; i < (mem_gated ? 0 : b); ++i)
-        if (write(tok[1], "x", 1) != 1) { std::perror("[split] token"); return false; }
-    // Memory-gated mode: one prove-token pipe PER CHILD. The release loop picks a
-    // partition (headW) and marks it 'P'; on the shared pipe any waiting child could
-    // take that byte, so the parent's 'P' might not be the child that proved; a
-    // thief leaves n-1 tokens for n waiters and the last one hangs in token_wait.
+        if (write(tok[1], "x", 1) != 1) {
+            std::perror("[split] token");
+            return false;
+        }
+    // Memory-gated mode
     std::vector<std::array<int, 2>> ptok(mem_gated ? n : 0);
-    for (auto &t : ptok)
-        if (pipe(t.data()) != 0) { std::perror("[split] pipe"); munmap(raw, shm_bytes); return false; }
-    // Memory-gated mode also gates the BUILD chain (btok) and gets per-child
-    // state transitions back over `stat` -- see the release loop below. The
-    // carry chain (gates[]) keeps build ORDER; btok only decides WHEN the next
-    // build may start. Barrier mode needs every partition built up front, so
-    // it keeps builds ungated.
+    for (auto& t : ptok)
+        if (pipe(t.data()) != 0) {
+            std::perror("[split] pipe");
+            munmap(raw, shm_bytes);
+            return false;
+        }
+    // Memory-gated mode also gates the BUILD chain
     const bool gate_builds = mem_gated && !barrier;
     int btok[2] = {-1, -1}, stat[2] = {-1, -1};
     if (mem_gated && (pipe(btok) != 0 || pipe(stat) != 0)) {
-        std::perror("[split] pipe"); munmap(raw, shm_bytes); return false;
+        std::perror("[split] pipe");
+        munmap(raw, shm_bytes);
+        return false;
     }
     auto send_stat = [&](char ev, int idx) {
-        if (!mem_gated) return;
+        if (!mem_gated)
+            return;
         ChainStat m{ev, idx};
-        if (write(stat[1], &m, sizeof m) != (ssize_t)sizeof m) _exit(1);
+        if (write(stat[1], &m, sizeof m) != (ssize_t)sizeof m)
+            _exit(1);
     };
 
-    // GKR_SPLIT_DEVICES="5,6": round-robin the children across HIP devices.
-    // Legal only in this mode: the parent reaches fork() with no HIP context, so
-    // each child's HIP runtime initializes after its HIP_VISIBLE_DEVICES is set.
+    // GKR_SPLIT_DEVICES="5,6": round-robin the children across HIP devices
     std::vector<std::string> devlist;
-    if (const char *dl = getenv("GKR_SPLIT_DEVICES")) {
+    if (const char* dl = getenv("GKR_SPLIT_DEVICES")) {
         std::string cur;
-        for (const char *q = dl;; ++q) {
+        for (const char* q = dl;; ++q) {
             if (*q == ',' || *q == '\0') {
-                if (!cur.empty()) devlist.push_back(cur);
+                if (!cur.empty())
+                    devlist.push_back(cur);
                 cur.clear();
-                if (*q == '\0') break;
-            } else cur += *q;
+                if (*q == '\0')
+                    break;
+            } else
+                cur += *q;
         }
-        std::cerr << "[split] spreading children over " << devlist.size()
-                  << " HIP devices (" << dl << ")\n";
+        std::cerr << "[split] spreading children over " << devlist.size() << " HIP devices (" << dl << ")\n";
     }
 
-    // GKR_WITGEN_DEVICE=W: one controller process owns HIP device W and runs EVERY
-    // partition's witgen, carrying the boundary in-process instead of through `shm`.
-    // Each built partition is handed to its proving child through the witness cache
-    // in a per-run /dev/shm directory; child i waits on ready[i], loads (a cache HIT
-    // is required), deletes the file, and proves on its GKR_SPLIT_DEVICES device.
-    // A child's witgen_s is therefore the HANDOFF (load) time, not witgen.
-    const char *wdev = getenv("GKR_WITGEN_DEVICE");
+    // GKR_WITGEN_DEVICE=W
+    const char* wdev = getenv("GKR_WITGEN_DEVICE");
     const bool ctrl = wdev && *wdev;
     std::string wc_dir;
     std::vector<std::array<int, 2>> ready;
     if (ctrl) {
         if (mem_gated) {
             std::cerr << "[split] GKR_WITGEN_DEVICE is not supported with --overlapped -1\n";
-            munmap(raw, shm_bytes); return false;
+            munmap(raw, shm_bytes);
+            return false;
         }
         wc_dir = "/dev/shm/zkgpt_wc_" + std::to_string((long)getpid());
         if (::mkdir(wc_dir.c_str(), 0700) != 0 && errno != EEXIST) {
-            std::perror("[split] mkdir handoff dir"); munmap(raw, shm_bytes); return false;
+            std::perror("[split] mkdir handoff dir");
+            munmap(raw, shm_bytes);
+            return false;
         }
         ready.resize(n);
-        for (auto &r : ready)
-            if (pipe(r.data()) != 0) { std::perror("[split] pipe"); munmap(raw, shm_bytes); return false; }
-        std::cerr << "[split] witgen controller on HIP device " << wdev
-                  << ", handoff via " << wc_dir << "\n";
+        for (auto& r : ready)
+            if (pipe(r.data()) != 0) {
+                std::perror("[split] pipe");
+                munmap(raw, shm_bytes);
+                return false;
+            }
+        std::cerr << "[split] witgen controller on HIP device " << wdev << ", handoff via " << wc_dir << "\n";
     }
 
     const double t0 = prof_now_us();
     std::vector<pid_t> pids;
     bool all_ok = true;
 
-    // Forked after every pipe exists, so it must close all it does not use: holding
-    // allgate[1] open would keep the witgen barrier from ever releasing.
+    // Forked after every pipe exists
     pid_t ctrl_pid = -1;
     if (ctrl) {
         std::cout.flush();
@@ -1568,20 +1453,37 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
         ctrl_pid = fork();
         if (ctrl_pid == 0) {
             prctl(PR_SET_PDEATHSIG, SIGTERM);
-            if (getppid() == 1) _exit(1);
-            signal(SIGPIPE, SIG_IGN);                    // a dead child must not kill the chain
-            for (auto &g : gates) { close(g[0]); close(g[1]); }
-            for (auto &g : started) { close(g[0]); close(g[1]); }
-            if (barrier) { close(allgate[0]); close(allgate[1]); close(notify[0]); close(notify[1]); }
-            close(tok[0]); close(tok[1]);
-            for (auto &t : ptok) { close(t[0]); close(t[1]); }
-            for (auto &r : ready) close(r[0]);
+            if (getppid() == 1)
+                _exit(1);
+            signal(SIGPIPE, SIG_IGN);  // a dead child must not kill the chain
+            for (auto& g : gates) {
+                close(g[0]);
+                close(g[1]);
+            }
+            for (auto& g : started) {
+                close(g[0]);
+                close(g[1]);
+            }
+            if (barrier) {
+                close(allgate[0]);
+                close(allgate[1]);
+                close(notify[0]);
+                close(notify[1]);
+            }
+            close(tok[0]);
+            close(tok[1]);
+            for (auto& t : ptok) {
+                close(t[0]);
+                close(t[1]);
+            }
+            for (auto& r : ready)
+                close(r[0]);
             setenv("HIP_VISIBLE_DEVICES", wdev, 1);
             setenv("ZKGPT_WITNESS_CACHE", wc_dir.c_str(), 1);
-            // Safe here and ONLY here: this process was forked before any HIP call.
-            gkr_config.witgen_gpu  = want_witgen_gpu;
-            gkr_config.round_gpu   = want_round_gpu;
-            gkr_config.gates_gpu   = want_gates_gpu;
+            // Safe here and ONLY here: this process was forked before any HIP call
+            gkr_config.witgen_gpu = want_witgen_gpu;
+            gkr_config.round_gpu = want_round_gpu;
+            gkr_config.gates_gpu = want_gates_gpu;
             gkr_config.witgen_full = want_witgen_full;
 
             SplitBlockCarryState carry;
@@ -1590,8 +1492,9 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
                 const bool is_last = (i + 1 == n);
                 PartitionState st;
                 const double tb0 = prof_now_us();
-                if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st)) _exit(1);
-                const double build_s = (prof_now_us() - tb0) / 1e6;   // includes the cache save
+                if (!build_partition(cfg, i, has_carry ? &carry : nullptr, st))
+                    _exit(1);
+                const double build_s = (prof_now_us() - tb0) / 1e6;  // includes the cache save
                 if (!is_last) {
                     ZKGPT_PHASE_SCOPE("export_carry");
                     carry = st.net->exportSplitBlockCarry(*st.p);
@@ -1599,14 +1502,16 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
                 }
                 (void)!write(ready[i][1], "x", 1);
                 close(ready[i][1]);
-                std::cout << "WITGEN_CTRL idx=" << i << " build_s=" << build_s
-                          << " fc_s=" << st.fc_s
+                std::cout << "WITGEN_CTRL idx=" << i << " build_s=" << build_s << " fc_s=" << st.fc_s
                           << " gpu_peak_mib=" << st.witgen_gpu_peak_mib
                           << " t_us=" << (prof_now_us() - t0) / 1e6 << std::endl;
             }
             _exit(0);
         }
-        if (ctrl_pid < 0) { std::perror("[split] fork controller"); all_ok = false; }
+        if (ctrl_pid < 0) {
+            std::perror("[split] fork controller");
+            all_ok = false;
+        }
     }
 
     for (int i = 0; i < n && all_ok; ++i) {
@@ -1615,27 +1520,33 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
         pid_t pid = fork();
         if (pid == 0) {
             prctl(PR_SET_PDEATHSIG, SIGTERM);
-            if (getppid() == 1) _exit(1);
+            if (getppid() == 1)
+                _exit(1);
             child_threads_set(tpc);
             if (!devlist.empty())
-                setenv("HIP_VISIBLE_DEVICES",
-                       devlist[i % devlist.size()].c_str(), 1);
+                setenv("HIP_VISIBLE_DEVICES", devlist[i % devlist.size()].c_str(), 1);
             for (int j = 0; j < (int)gates.size(); ++j) {
-                if (j != i)     close(gates[j][1]);      // only child i writes gate i
-                if (j != i - 1) close(gates[j][0]);      // only child i reads gate i-1
-                if (j != i)     close(started[j][1]);
-                if (j != i - 1) close(started[j][0]);
+                if (j != i)
+                    close(gates[j][1]);  // only child i writes gate i
+                if (j != i - 1)
+                    close(gates[j][0]);  // only child i reads gate i-1
+                if (j != i)
+                    close(started[j][1]);
+                if (j != i - 1)
+                    close(started[j][0]);
             }
-            auto signal_started = [&] {                  // see started[] above
+            auto signal_started = [&] {  // see started[] above
                 if (i + 1 < n) {
-                    if (write(started[i][1], "x", 1) != 1) _exit(1);
+                    if (write(started[i][1], "x", 1) != 1)
+                        _exit(1);
                     close(started[i][1]);
                 }
             };
             if (ctrl) {
                 for (int j = 0; j < n; ++j) {
-                    close(ready[j][1]);                  // only the controller writes
-                    if (j != i) close(ready[j][0]);
+                    close(ready[j][1]);  // only the controller writes
+                    if (j != i)
+                        close(ready[j][0]);
                 }
                 setenv("ZKGPT_WITNESS_CACHE", wc_dir.c_str(), 1);
             }
@@ -1644,131 +1555,149 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
             zkgpt_phase::set_part(i);
             SplitBlockCarryState carry;
             if (ctrl) {
-                ZKGPT_PHASE_SCOPE("handoff_wait");      // controller has built partition i
+                ZKGPT_PHASE_SCOPE("handoff_wait");  // controller has built partition i
                 char go = 0;
                 ssize_t r;
-                while ((r = read(ready[i][0], &go, 1)) < 0 && errno == EINTR) {}
-                if (r != 1) { std::cerr << "[split] child " << i << ": witgen controller died\n"; _exit(1); }
+                while ((r = read(ready[i][0], &go, 1)) < 0 && errno == EINTR) {
+                }
+                if (r != 1) {
+                    std::cerr << "[split] child " << i << ": witgen controller died\n";
+                    _exit(1);
+                }
                 close(ready[i][0]);
             }
             const bool prebuild = prebuild_on && !ctrl && i > 0;
             auto acquire_build_slot = [&] {
-                if (!gate_builds) return;
-                ZKGPT_PHASE_SCOPE("build_wait");       // acquire a build slot
+                if (!gate_builds)
+                    return;
+                ZKGPT_PHASE_SCOPE("build_wait");  // acquire a build slot
                 send_stat('w', i);
                 char go = 0;
                 ssize_t r;
-                while ((r = read(btok[0], &go, 1)) < 0 && errno == EINTR) {}
-                if (r != 1) { std::cerr << "[split] child " << i << ": build gate closed\n"; _exit(1); }
+                while ((r = read(btok[0], &go, 1)) < 0 && errno == EINTR) {
+                }
+                if (r != 1) {
+                    std::cerr << "[split] child " << i << ": build gate closed\n";
+                    _exit(1);
+                }
             };
             auto wait_carry = [&] {
                 {
                     ZKGPT_PHASE_SCOPE("carry_wait");
                     char go = 0;
                     ssize_t r;
-                    while ((r = read(gates[i - 1][0], &go, 1)) < 0 && errno == EINTR) {}
-                    if (r != 1) { std::cerr << "[split] child " << i << ": upstream died\n"; _exit(1); }
+                    while ((r = read(gates[i - 1][0], &go, 1)) < 0 && errno == EINTR) {
+                    }
+                    if (r != 1) {
+                        std::cerr << "[split] child " << i << ": upstream died\n";
+                        _exit(1);
+                    }
                     close(gates[i - 1][0]);
                 }
                 ZKGPT_PHASE_SCOPE("carry_import");
                 carry.input_data.assign(shm->data, shm->data + shm->count);
                 carry.input_offset = shm->input_offset;
-                carry.len          = shm->len;
-                carry.feature_dim  = shm->feature_dim;
-                carry.input_c      = shm->input_c;
-                carry.input_e      = shm->input_e;
+                carry.len = shm->len;
+                carry.feature_dim = shm->feature_dim;
+                carry.input_c = shm->input_c;
+                carry.input_e = shm->input_e;
             };
             if (ctrl) {
-                pin_child_cores(i);   // controller mode: the build happened in the controller
+                pin_child_cores(i);  // controller mode: the build happened in the controller
             } else if (i == 0) {
                 pin_child_cores(i);
-                signal_started();                        // child 0 builds unconditionally
+                signal_started();  // child 0 builds unconditionally
             } else if (prebuild) {
                 {
-                    ZKGPT_PHASE_SCOPE("chain_wait");     // predecessor has its build slot
+                    ZKGPT_PHASE_SCOPE("chain_wait");  // predecessor has its build slot
                     char go = 0;
                     ssize_t r;
-                    while ((r = read(started[i - 1][0], &go, 1)) < 0 && errno == EINTR) {}
-                    if (r != 1) { std::cerr << "[split] child " << i << ": upstream died\n"; _exit(1); }
+                    while ((r = read(started[i - 1][0], &go, 1)) < 0 && errno == EINTR) {
+                    }
+                    if (r != 1) {
+                        std::cerr << "[split] child " << i << ": upstream died\n";
+                        _exit(1);
+                    }
                     close(started[i - 1][0]);
                 }
                 acquire_build_slot();
                 pin_child_cores(i);
                 signal_started();
-                // Placeholder of the boundary's known shape; the hook in create()
-                // swaps the real carry in before the first value is computed.
+                // Placeholder of the boundary's known shape
                 long long f = 1;
-                while (f < cfg.embed_size) f <<= 1;
+                while (f < cfg.embed_size)
+                    f <<= 1;
                 carry.input_data.assign((size_t)cfg.len * f, F_ZERO);
                 carry.input_offset = 0;
                 carry.len = cfg.len;
                 carry.feature_dim = f;
-                carry.input_c = 1; carry.input_e = 0;
+                carry.input_c = 1;
+                carry.input_e = 0;
             } else {
                 wait_carry();
                 acquire_build_slot();
                 pin_child_cores(i);
                 signal_started();
             }
-            // Safe here and ONLY here: this process was forked before any HIP call.
+            // Safe here and ONLY here: this process was forked before any HIP call
             gkr_config.witgen_gpu = want_witgen_gpu;
-            gkr_config.round_gpu  = want_round_gpu;
-            gkr_config.gates_gpu  = want_gates_gpu;
-            gkr_config.witgen_full   = want_witgen_full;
+            gkr_config.round_gpu = want_round_gpu;
+            gkr_config.gates_gpu = want_gates_gpu;
+            gkr_config.witgen_full = want_witgen_full;
 
             PartitionState st;
-            // Hands the carry to child i+1 through shm and opens its gate.
-            auto publish_carry = [&](const SplitBlockCarryState &nx) {
+            // Hands the carry to child i+1 through shm and opens its gate
+            auto publish_carry = [&](const SplitBlockCarryState& nx) {
                 ZKGPT_PHASE_SCOPE("carry_publish");
                 if ((long long)nx.input_data.size() > cap) {
-                    std::cerr << "[split] carry " << nx.input_data.size()
-                              << " > cap " << cap << "\n";
+                    std::cerr << "[split] carry " << nx.input_data.size() << " > cap " << cap << "\n";
                     _exit(1);
                 }
                 std::memcpy(shm->data, nx.input_data.data(), nx.input_data.size() * sizeof(F));
-                shm->count        = nx.input_data.size();
+                shm->count = nx.input_data.size();
                 shm->input_offset = nx.input_offset;
-                shm->len          = nx.len;
-                shm->feature_dim  = nx.feature_dim;
-                shm->input_c      = nx.input_c;
-                shm->input_e      = nx.input_e;
-                if (write(gates[i][1], "x", 1) != 1) _exit(1);
+                shm->len = nx.len;
+                shm->feature_dim = nx.feature_dim;
+                shm->input_c = nx.input_c;
+                shm->input_e = nx.input_e;
+                if (write(gates[i][1], "x", 1) != 1)
+                    _exit(1);
                 close(gates[i][1]);
             };
-            // GKR_EARLY_CARRY=1: publish from inside create(), as soon as the output
-            // values are final, instead of after merge/initSubset/copyIn. The early
-            // carry is kept and checked against the end-of-build one below.
+            // GKR_EARLY_CARRY=1
             const bool early = !ctrl && !is_last && getenv("GKR_EARLY_CARRY");
             SplitBlockCarryState early_carry;
             bool published = false;
-            std::function<void(const prover &)> hook;
+            std::function<void(const prover&)> hook;
             if (early)
-                hook = [&](const prover &pr) {
+                hook = [&](const prover& pr) {
                     early_carry = st.net->exportSplitBlockCarry(pr);
                     publish_carry(early_carry);
                     published = true;
-                    std::cout << "EARLY_CARRY idx=" << i << " t_us="
-                              << (prof_now_us() - t0) / 1e6 << std::endl;
+                    std::cout << "EARLY_CARRY idx=" << i << " t_us=" << (prof_now_us() - t0) / 1e6
+                              << std::endl;
                 };
-            std::function<void(int &, int &)> pre_hook;
+            std::function<void(int&, int&)> pre_hook;
             if (prebuild)
-                pre_hook = [&](int &ic, int &ie) {
+                pre_hook = [&](int& ic, int& ie) {
                     const long long l0 = carry.len, f0 = carry.feature_dim;
                     wait_carry();
-                    if (carry.len != l0 || carry.feature_dim != f0 || carry.input_offset != 0
-                        || (long long)carry.input_data.size() != l0 * f0) {
-                        std::cerr << "[split] child " << i << ": prebuild shape mismatch len="
-                                  << carry.len << "/" << l0 << " fdim=" << carry.feature_dim
-                                  << "/" << f0 << " off=" << carry.input_offset
-                                  << " n=" << carry.input_data.size() << "\n";
+                    if (carry.len != l0 || carry.feature_dim != f0 || carry.input_offset != 0 ||
+                        (long long)carry.input_data.size() != l0 * f0) {
+                        std::cerr << "[split] child " << i << ": prebuild shape mismatch len=" << carry.len
+                                  << "/" << l0 << " fdim=" << carry.feature_dim << "/" << f0
+                                  << " off=" << carry.input_offset << " n=" << carry.input_data.size()
+                                  << "\n";
                         _exit(1);
                     }
                     maybe_tamper_carry(carry, (std::size_t)i);
-                    ic = carry.input_c; ie = carry.input_e;
+                    ic = carry.input_c;
+                    ie = carry.input_e;
                 };
             const double tb0 = prof_now_us();
             zkgpt_wc::last_load_hit() = false;
-            if (!build_partition(cfg, i, (i > 0 && !ctrl) ? &carry : nullptr, st, hook, pre_hook)) _exit(1);
+            if (!build_partition(cfg, i, (i > 0 && !ctrl) ? &carry : nullptr, st, hook, pre_hook))
+                _exit(1);
             const double build_s = (prof_now_us() - tb0) / 1e6;
             if (ctrl) {
                 if (!zkgpt_wc::last_load_hit()) {
@@ -1776,321 +1705,346 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
                               << " -- refusing to prove a rebuilt (carry-less) partition\n";
                     _exit(1);
                 }
-                remove_part_files(wc_dir, i);            // free the /dev/shm copy
+                remove_part_files(wc_dir, i);  // free the /dev/shm copy
             }
 
             if (!is_last && !ctrl) {
                 SplitBlockCarryState nx = st.net->exportSplitBlockCarry(*st.p);
                 if (!published) {
                     publish_carry(nx);
-                } else if (nx.input_data != early_carry.input_data
-                           || nx.input_offset != early_carry.input_offset
-                           || nx.len != early_carry.len
-                           || nx.feature_dim != early_carry.feature_dim
-                           || nx.input_c != early_carry.input_c
-                           || nx.input_e != early_carry.input_e) {
-                    // Child i+1 already built from the early copy: its proof would be
-                    // of the wrong input. Fail the run rather than let it ACCEPT.
-                    std::cerr << "[split] child " << i << ": EARLY carry differs from the"
+                } else if (nx.input_data != early_carry.input_data ||
+                           nx.input_offset != early_carry.input_offset || nx.len != early_carry.len ||
+                           nx.feature_dim != early_carry.feature_dim || nx.input_c != early_carry.input_c ||
+                           nx.input_e != early_carry.input_e) {
+                    // Child i+1 already built from the early copy: its proof would be of the wrong input
+                    std::cerr << "[split] child " << i
+                              << ": EARLY carry differs from the"
                                  " end-of-build carry -- early publish is unsafe here\n";
                     _exit(1);
                 }
             }
-            std::cout << "OVERLAPPED_BUILT idx=" << i << " witgen_s=" << build_s
-                      << " witgen_fc_s=" << st.fc_s
+            std::cout << "OVERLAPPED_BUILT idx=" << i << " witgen_s=" << build_s << " witgen_fc_s=" << st.fc_s
                       << " witgen_host_peak_mib=" << st.witgen_host_peak_mib
                       << " witgen_resident_mib=" << st.witgen_resident_mib
-                      << " witgen_h2d_gib=" << st.witgen_h2d_gib
-                      << " witgen_d2h_gib=" << st.witgen_d2h_gib
+                      << " witgen_h2d_gib=" << st.witgen_h2d_gib << " witgen_d2h_gib=" << st.witgen_d2h_gib
                       << " t_us=" << (prof_now_us() - t0) / 1e6 << std::endl;
 
             if (barrier) {
                 ZKGPT_PHASE_SCOPE("barrier_wait");
-                close(allgate[1]);                       // child never writes the gate
-                if (is_last) { if (write(notify[1], "x", 1) != 1) _exit(1); }
+                close(allgate[1]);  // child never writes the gate
+                if (is_last) {
+                    if (write(notify[1], "x", 1) != 1)
+                        _exit(1);
+                }
                 close(notify[1]);
-                char go = 0;                             // blocks until parent's EOF
-                while (read(allgate[0], &go, 1) < 0 && errno == EINTR) {}
+                char go = 0;  // blocks until parent's EOF
+                while (read(allgate[0], &go, 1) < 0 && errno == EINTR) {
+                }
                 close(allgate[0]);
             }
             send_stat('B', i);
             {
-                ZKGPT_PHASE_SCOPE("token_wait");               // acquire a proving slot
+                ZKGPT_PHASE_SCOPE("token_wait");  // acquire a proving slot
                 send_stat('W', i);
                 char t = 0;
                 ssize_t r;
-                while ((r = read(mem_gated ? ptok[i][0] : tok[0], &t, 1)) < 0 && errno == EINTR) {}
-                if (r != 1) { std::cerr << "[split] child " << i << ": prove gate closed\n"; _exit(1); }
+                while ((r = read(mem_gated ? ptok[i][0] : tok[0], &t, 1)) < 0 && errno == EINTR) {
+                }
+                if (r != 1) {
+                    std::cerr << "[split] child " << i << ": prove gate closed\n";
+                    _exit(1);
+                }
             }
             zkgpt_gpu::gkr_vram_peak_start();
             PartResult res;
-            // Peak-release semaphore: right after verify_lasso (where host and VRAM
-            // both peak) the prover frees its Lasso-only state and posts 'R'; the
-            // parent then charges it what it actually holds, not its full peak, and
-            // can hand the next proving slot out (see verifier.hpp).
-            if (mem_gated) g_past_peak_hook = [&] { send_stat('R', i); };
+            // Peak-release semaphore
+            if (mem_gated)
+                g_past_peak_hook = [&] { send_stat('R', i); };
             bool ok = prove_built_partition(cfg, i, st, res, tpc);
             g_past_peak_hook = nullptr;
             gkr_sc_teardown();
             gkr_pred_report();
             gkr_pred_teardown();
             zkgpt_gpu::gkr_vram_peak_stop();
-            // Return the slot -- but only in the fixed-W token mode. In memory-gated
-            // mode the parent issues every prove token itself (one per release
-            // decision); a child handing its token back as well would leave a spare
-            // token, so the next waiter would prove without being released.
-            if (!mem_gated && write(tok[1], "x", 1) != 1) ok = false;
+            // Return the slot
+            if (!mem_gated && write(tok[1], "x", 1) != 1)
+                ok = false;
             unpin_child_cores();
             std::cout.flush();
             _exit(ok ? 0 : 1);
         }
-        if (pid < 0) { std::perror("[split] fork"); all_ok = false; break; }
+        if (pid < 0) {
+            std::perror("[split] fork");
+            all_ok = false;
+            break;
+        }
         pids.push_back(pid);
     }
 
-    for (auto &g : gates) { close(g[0]); close(g[1]); }
-    for (auto &r : ready) { close(r[0]); close(r[1]); }   // controller death -> EOF in children
+    for (auto& g : gates) {
+        close(g[0]);
+        close(g[1]);
+    }
+    for (auto& r : ready) {
+        close(r[0]);
+        close(r[1]);
+    }  // controller death -> EOF in children
     double prep_s = 0, makespan_s = 0, t_release = 0;
     if (barrier) {
-        close(allgate[0]);                               // parent only writes the gate
-        close(notify[1]);                                // only the last child writes
-        char done = 0; ssize_t r;
-        while ((r = read(notify[0], &done, 1)) < 0 && errno == EINTR) {}
+        close(allgate[0]);  // parent only writes the gate
+        close(notify[1]);   // only the last child writes
+        char done = 0;
+        ssize_t r;
+        while ((r = read(notify[0], &done, 1)) < 0 && errno == EINTR) {
+        }
         close(notify[0]);
-        if (r != 1) { std::cerr << "[split] barrier: last child died before witgen\n"; all_ok = false; }
+        if (r != 1) {
+            std::cerr << "[split] barrier: last child died before witgen\n";
+            all_ok = false;
+        }
         t_release = prof_now_us();
         prep_s = (t_release - t0) / 1e6;
-        close(allgate[1]);                               // EOF == go, to every child
+        close(allgate[1]);  // EOF == go, to every child
     }
-    // Memory-gated mode: the parent decides when each partition may start
-    // building and proving, gating BOTH (a built-but-not-proving partition
-    // still holds its whole witness, and a proving one grows well past that at
-    // verify_lasso). Each release is charged the FULL peak/built estimate of
-    // every live child holding a slot, not just its remaining growth past
-    // current VmHWM -- partial credit undercounts right after a slot is
-    // granted, before VmHWM catches up to what it's about to allocate.
-    // GKR_PART_PEAK_MIB / GKR_PART_BUILT_MIB seed the estimates and self-
-    // correct upward (never down) from observed VmHWM. GKR_MIN_FREE_MIB is the
-    // margin kept free. Proving is preferred over building since only a
-    // finished prover gives memory back; if nothing is proving, the head
-    // waiter is released regardless (better to let the kernel refuse than
-    // deadlock). No timeout -- the outer queue's watchdog bounds the run.
+    // Memory-gated mode
     std::vector<bool> reaped(n, false);
-    std::vector<int>  exit_stt(n, 0);
+    std::vector<int> exit_stt(n, 0);
     if (mem_gated && all_ok) {
-        const char *env = getenv("GKR_MIN_FREE_MIB");
+        const char* env = getenv("GKR_MIN_FREE_MIB");
         const long long min_free_kib = (env ? atoll(env) : 40960LL) * 1024LL;
         const int gpu_cap = getenv("GKR_GPU_PROCS") ? atoi(getenv("GKR_GPU_PROCS")) : 0;
-        long long peak_kib  = (getenv("GKR_PART_PEAK_MIB")  ? atoll(getenv("GKR_PART_PEAK_MIB"))  : 0LL) * 1024LL;
-        long long built_kib = (getenv("GKR_PART_BUILT_MIB") ? atoll(getenv("GKR_PART_BUILT_MIB")) : 0LL) * 1024LL;
-        // VRAM gate (single-device runs; GKR_VRAM_GATE=0 turns it off). Seeds:
-        // GKR_PART_VRAM_MIB = one proving partition's VRAM peak, GKR_PART_WG_VRAM_MIB
-        // = one GPU-witgen build's; both self-correct upward from each child's
-        // observed KFD VRAM. GKR_VRAM_MARGIN_MIB is kept free (default 2 GiB).
+        long long peak_kib =
+            (getenv("GKR_PART_PEAK_MIB") ? atoll(getenv("GKR_PART_PEAK_MIB")) : 0LL) * 1024LL;
+        long long built_kib =
+            (getenv("GKR_PART_BUILT_MIB") ? atoll(getenv("GKR_PART_BUILT_MIB")) : 0LL) * 1024LL;
         VramDev vdev;
         bool vram_gate = false;
         {
-            const char *g = getenv("GKR_VRAM_GATE");
-            const char *hv = getenv("HIP_VISIBLE_DEVICES");
-            const bool single = devlist.empty() && ctrl_pid <= 0
-                             && (!hv || !strchr(hv, ','));
+            const char* g = getenv("GKR_VRAM_GATE");
+            const char* hv = getenv("HIP_VISIBLE_DEVICES");
+            const bool single = devlist.empty() && ctrl_pid <= 0 && (!hv || !strchr(hv, ','));
             if ((!g || strcmp(g, "0")) && single)
                 vram_gate = vram_dev_for_hip_index(hv && *hv ? atoi(hv) : 0, vdev);
         }
-        long long vpeak_kib = (getenv("GKR_PART_VRAM_MIB")    ? atoll(getenv("GKR_PART_VRAM_MIB"))    : 0LL) * 1024LL;
-        long long vwg_kib   = (getenv("GKR_PART_WG_VRAM_MIB") ? atoll(getenv("GKR_PART_WG_VRAM_MIB")) : 0LL) * 1024LL;
-        const long long vmargin_kib = (getenv("GKR_VRAM_MARGIN_MIB") ? atoll(getenv("GKR_VRAM_MARGIN_MIB")) : 2048LL) * 1024LL;
+        long long vpeak_kib =
+            (getenv("GKR_PART_VRAM_MIB") ? atoll(getenv("GKR_PART_VRAM_MIB")) : 0LL) * 1024LL;
+        long long vwg_kib =
+            (getenv("GKR_PART_WG_VRAM_MIB") ? atoll(getenv("GKR_PART_WG_VRAM_MIB")) : 0LL) * 1024LL;
+        const long long vmargin_kib =
+            (getenv("GKR_VRAM_MARGIN_MIB") ? atoll(getenv("GKR_VRAM_MARGIN_MIB")) : 2048LL) * 1024LL;
         std::vector<long long> vhwm(n, 0);
-        // Once partitions have FINISHED, their observed peaks replace the seeds (x1.1,
-        // the 1 s sampler can miss a spike): a seed is only a guess for the first wave,
-        // and an over-estimate throttles every later release. Upward correction from
-        // live children still applies on top.
+        // Once partitions have FINISHED
         std::vector<long long> built_obs(n, 0);
         long long done_peak = 0, done_vpeak = 0, done_built = 0, done_vbuild = 0;
         std::vector<long long> vbuild_obs(n, 0);
         if (vram_gate)
-            std::cerr << "[split] vram-gated: gpu_id=" << vdev.gpu_id << " free="
-                      << vram_free_kib(vdev) / 1048576.0 << " GiB prove_est="
-                      << vpeak_kib / 1048576.0 << " GiB build_est=" << vwg_kib / 1048576.0
-                      << " GiB margin=" << vmargin_kib / 1048576.0 << " GiB\n";
+            std::cerr << "[split] vram-gated: gpu_id=" << vdev.gpu_id
+                      << " free=" << vram_free_kib(vdev) / 1048576.0
+                      << " GiB prove_est=" << vpeak_kib / 1048576.0
+                      << " GiB build_est=" << vwg_kib / 1048576.0 << " GiB margin=" << vmargin_kib / 1048576.0
+                      << " GiB\n";
         close(stat[1]);
         fcntl(stat[0], F_SETFL, fcntl(stat[0], F_GETFL) | O_NONBLOCK);
-        // per-child state: F forked (idle in carry_wait), w waiting for a build
-        // slot, b building, B built, W waiting for a proving slot, P proving,
-        // R proving but past its peak (posted after verify_lasso: charged its
-        // measured RSS, x1.1, not a full peak; its VRAM only shrinks from there),
-        // X exited. Child 0 builds unconditionally (no build token), so it is
-        // counted as one build slot already issued.
         std::vector<char> state(n, 'F');
-        std::vector<long long> hwm(n, 0), rhold(n, 0);   // rhold: max RSS seen while 'R'
+        std::vector<long long> hwm(n, 0), rhold(n, 0);  // rhold: max RSS seen while 'R'
         state[0] = 'b';
         int live = n, prove_tok = 0, build_tok = gate_builds ? 1 : n;
         double last_tick_us = prof_now_us();
         std::cerr << "[split] mem-gated: min_free=" << min_free_kib / 1048576.0
-                  << " GiB peak_est=" << peak_kib / 1048576.0
-                  << " GiB built_est=" << built_kib / 1048576.0 << " GiB tpc=" << tpc << "\n";
+                  << " GiB peak_est=" << peak_kib / 1048576.0 << " GiB built_est=" << built_kib / 1048576.0
+                  << " GiB tpc=" << tpc << "\n";
         while (live > 0) {
             ChainStat m;
             while (read(stat[0], &m, sizeof m) == (ssize_t)sizeof m)
                 if (m.idx >= 0 && m.idx < n && state[m.idx] != 'X') {
                     state[m.idx] = m.ev;
                     if (m.ev == 'R')
-                        std::cerr << "[split] mem-gated: partition " << m.idx << " past peak (rss="
-                                  << proc_rss_kib(pids[m.idx]) / 1048576.0 << " GiB, peak "
+                        std::cerr << "[split] mem-gated: partition " << m.idx
+                                  << " past peak (rss=" << proc_rss_kib(pids[m.idx]) / 1048576.0
+                                  << " GiB, peak "
                                   << std::max(hwm[m.idx], proc_hwm_kib(pids[m.idx])) / 1048576.0 << " GiB)\n";
                 }
-            int stt = 0; pid_t r;
+            int stt = 0;
+            pid_t r;
             while ((r = waitpid(-1, &stt, WNOHANG)) > 0) {
-                for (int i = 0; i < n; ++i) if (pids[i] == r && !reaped[i]) {
-                    reaped[i] = true; exit_stt[i] = stt; state[i] = 'X'; --live;
-                    if (!WIFEXITED(stt) || WEXITSTATUS(stt) != 0) {
-                        std::cerr << "[split] child pid " << r << " failed (status " << stt << ")\n";
-                        all_ok = false;
-                    } else {
-                        done_peak   = std::max(done_peak, hwm[i]);
-                        done_vpeak  = std::max(done_vpeak, vhwm[i]);
-                        done_built  = std::max(done_built, built_obs[i]);
-                        done_vbuild = std::max(done_vbuild, vbuild_obs[i]);
-                        const long long op = peak_kib, ob = built_kib;
-                        if (done_peak > 0)  peak_kib  = done_peak  * 11 / 10;
-                        if (done_built > 0) built_kib = done_built * 11 / 10;
-                        if (vram_gate && done_vpeak > 0)  vpeak_kib = done_vpeak  * 11 / 10;
-                        if (vram_gate && done_vbuild > 0) vwg_kib   = done_vbuild * 11 / 10;
-                        std::cerr << "[split] mem-gated: partition " << i << " done: host peak "
-                                  << hwm[i] / 1048576.0 << " GiB -> peak_est " << op / 1048576.0
-                                  << " -> " << peak_kib / 1048576.0 << " GiB, built_est "
-                                  << ob / 1048576.0 << " -> " << built_kib / 1048576.0 << " GiB"
-                                  << (vram_gate ? ", vprove_est " + std::to_string(vpeak_kib / 1024) + " MiB" : std::string())
-                                  << "\n";
+                for (int i = 0; i < n; ++i)
+                    if (pids[i] == r && !reaped[i]) {
+                        reaped[i] = true;
+                        exit_stt[i] = stt;
+                        state[i] = 'X';
+                        --live;
+                        if (!WIFEXITED(stt) || WEXITSTATUS(stt) != 0) {
+                            std::cerr << "[split] child pid " << r << " failed (status " << stt << ")\n";
+                            all_ok = false;
+                        } else {
+                            done_peak = std::max(done_peak, hwm[i]);
+                            done_vpeak = std::max(done_vpeak, vhwm[i]);
+                            done_built = std::max(done_built, built_obs[i]);
+                            done_vbuild = std::max(done_vbuild, vbuild_obs[i]);
+                            const long long op = peak_kib, ob = built_kib;
+                            if (done_peak > 0)
+                                peak_kib = done_peak * 11 / 10;
+                            if (done_built > 0)
+                                built_kib = done_built * 11 / 10;
+                            if (vram_gate && done_vpeak > 0)
+                                vpeak_kib = done_vpeak * 11 / 10;
+                            if (vram_gate && done_vbuild > 0)
+                                vwg_kib = done_vbuild * 11 / 10;
+                            std::cerr
+                                << "[split] mem-gated: partition " << i << " done: host peak "
+                                << hwm[i] / 1048576.0 << " GiB -> peak_est " << op / 1048576.0 << " -> "
+                                << peak_kib / 1048576.0 << " GiB, built_est " << ob / 1048576.0 << " -> "
+                                << built_kib / 1048576.0 << " GiB"
+                                << (vram_gate ? ", vprove_est " + std::to_string(vpeak_kib / 1024) + " MiB"
+                                              : std::string())
+                                << "\n";
+                        }
                     }
-                }
             }
-            if (!all_ok) break;
+            if (!all_ok)
+                break;
             long long growth = 0, build_growth = 0, vgrowth = 0, our_rss = 0, our_vram = 0;
             int nP = 0, nb = 0, nwait = 0, headW = -1, headw = -1;
             for (int i = 0; i < n; ++i) {
-                if (state[i] == 'X' || state[i] == 'F' || state[i] == 'w') { if (state[i] == 'w' && headw < 0) headw = i; continue; }
+                if (state[i] == 'X' || state[i] == 'F' || state[i] == 'w') {
+                    if (state[i] == 'w' && headw < 0)
+                        headw = i;
+                    continue;
+                }
                 hwm[i] = std::max(hwm[i], proc_hwm_kib(pids[i]));
-                if (state[i] == 'P' || state[i] == 'R') { peak_kib = std::max(peak_kib, hwm[i]); ++nP; }
+                if (state[i] == 'P' || state[i] == 'R') {
+                    peak_kib = std::max(peak_kib, hwm[i]);
+                    ++nP;
+                }
                 if (state[i] == 'B' || state[i] == 'W') {
                     built_kib = std::max(built_kib, hwm[i]);
                     built_obs[i] = std::max(built_obs[i], hwm[i]);
                 }
-                if (state[i] == 'W' && headW < 0) headW = i;
+                if (state[i] == 'W' && headW < 0)
+                    headW = i;
                 // Full charge, not "remaining growth": a granted slot reserves its
-                // WHOLE declared size against the box from the moment it's granted,
-                // regardless of how much it has actually touched yet (see the note
-                // above this loop for why the partial-credit version undercounted).
-                if (state[i] == 'P' || state[i] == 'W' || state[i] == 'B') growth += peak_kib;
-                else if (state[i] == 'R') {   // past peak: what it holds, from its own RSS
+                if (state[i] == 'P' || state[i] == 'W' || state[i] == 'B')
+                    growth += peak_kib;
+                else if (state[i] == 'R') {  // past peak: what it holds, from its own RSS
                     rhold[i] = std::max(rhold[i], proc_rss_kib(pids[i]));
                     growth += rhold[i] * 11 / 10;
+                } else if (state[i] == 'b') {
+                    growth += built_kib;
+                    ++nb;
                 }
-                else if (state[i] == 'b') { growth += built_kib; ++nb; }
-                if (state[i] == 'b' || state[i] == 'B' || state[i] == 'W') ++nwait;
+                if (state[i] == 'b' || state[i] == 'B' || state[i] == 'W')
+                    ++nwait;
                 our_rss += proc_rss_kib(pids[i]);
-                // VRAM: what each slot holder may still add on top of what the
-                // device already shows as used (full estimate until it shows up).
                 if (vram_gate) {
                     const long long cur = proc_vram_kib(pids[i], vdev);
                     our_vram += cur;
                     vhwm[i] = std::max(vhwm[i], cur);
-                    if (state[i] == 'P') { vpeak_kib = std::max(vpeak_kib, vhwm[i]);
-                                           vgrowth += std::max(0LL, vpeak_kib - cur); }
-                    else if (state[i] == 'b') { vwg_kib = std::max(vwg_kib, vhwm[i]);
-                                                vbuild_obs[i] = std::max(vbuild_obs[i], vhwm[i]);
-                                                vgrowth += std::max(0LL, vwg_kib - cur); }
+                    if (state[i] == 'P') {
+                        vpeak_kib = std::max(vpeak_kib, vhwm[i]);
+                        vgrowth += std::max(0LL, vpeak_kib - cur);
+                    } else if (state[i] == 'b') {
+                        vwg_kib = std::max(vwg_kib, vhwm[i]);
+                        vbuild_obs[i] = std::max(vbuild_obs[i], vhwm[i]);
+                        vgrowth += std::max(0LL, vwg_kib - cur);
+                    }
                 }
             }
-            // A partition building now is a partition proving later: with the early
-            // carry, i+1 starts building while i is still 'b', so every partition
-            // ALREADY building is charged its full prove peak before another build is
-            // granted (the new one at its built size). One build may still run ahead
-            // of a big prover; a cascade of builds that can never all prove cannot.
             build_growth = growth + (long long)nb * (peak_kib - built_kib);
             const long long avail = mem_available_kib();
             const long long room = avail - growth - min_free_kib;
             const long long build_room = avail - build_growth - min_free_kib;
             const long long vfree = vram_gate ? vram_free_kib(vdev) : 0;
-            // Strict on VRAM as on host: every live slot is charged its full remaining
-            // growth to its peak, as if all peaked at once.
+            // Strict on VRAM as on host
             const long long vroom = vram_gate ? vfree - vgrowth - vmargin_kib : 0;
             const bool v_prove_ok = !vram_gate || vroom - vpeak_kib >= 0;
-            // Witgen cap: K = how many partitions can PROVE at once on this box, from the
-            // strict per-prover peaks (host and VRAM; what our children hold now is added
-            // back to what is free). At most K partitions may be building or waiting to
-            // prove -- one queued behind each proving slot -- so witgen still overlaps
-            // proving but never piles up built partitions that no prover can take.
             long long kcap = peak_kib > 0 ? (avail + our_rss - min_free_kib) / peak_kib : n;
             if (vram_gate && vpeak_kib > 0)
                 kcap = std::min(kcap, (vfree + our_vram - vmargin_kib) / vpeak_kib);
             kcap = std::max(1LL, std::min<long long>(kcap, n));
             const bool cap_ok = nwait < kcap;
-            // GKR_GPU_PROCS=K: at most K children alive past their build grant (building,
-            // built, waiting or proving) -- i.e. holding a HIP context on the shared GPU. The
-            // MI210's hardware scheduler runs 8 processes at once (hws_max_conc_proc=-1 ->
-            // 8 KFD VMIDs); above that it time-slices the runlist and every per-round sync in
-            // the GPU sumchecks waits a slice (Lasso sc_call 1.0 s alone -> 4-11 s at 12-19).
+            // GKR_GPU_PROCS=K
             const bool gpu_ok = gpu_cap <= 0 || nP + nwait < gpu_cap;
-            // Thread pool: every child past its build grant (building, built, waiting, proving)
-            // holds tpc threads, so a new build is granted only while all of them plus it fit in
-            // cfg.num_threads. Prove grants turn a waiting child into a proving one and add none.
             const bool thr_ok = (long long)(nP + nwait + 1) * tpc <= cfg.num_threads;
             const bool v_build_ok = !vram_gate || vroom - vwg_kib >= 0;
             bool granted = false;
             if (headW >= 0 && prove_tok < n && ((room >= 0 && v_prove_ok) || nP == 0)) {
                 granted = true;
                 if (room < 0)
-                    std::cerr << "[split] mem-gated: nothing proving -- releasing partition "
-                              << headW << " to prove despite room=" << room / 1048576.0 << " GiB\n";
-                if (write(ptok[headW][1], "x", 1) != 1) { std::perror("[split] token"); all_ok = false; break; }
-                ++prove_tok; state[headW] = 'P';
+                    std::cerr << "[split] mem-gated: nothing proving -- releasing partition " << headW
+                              << " to prove despite room=" << room / 1048576.0 << " GiB\n";
+                if (write(ptok[headW][1], "x", 1) != 1) {
+                    std::perror("[split] token");
+                    all_ok = false;
+                    break;
+                }
+                ++prove_tok;
+                state[headW] = 'P';
                 std::cerr << "[split] mem-gated: prove slot -> partition " << headW
                           << " (avail=" << avail / 1048576.0 << " GiB owed=" << growth / 1048576.0
                           << " GiB proving=" << nP + 1 << ")\n";
-            } else if (headw >= 0 && build_tok < n
-                       && ((build_room - built_kib >= 0 && v_build_ok && cap_ok && gpu_ok && thr_ok) || (nP == 0 && headW < 0 && nb == 0))) {
+            } else if (headw >= 0 && build_tok < n &&
+                       ((build_room - built_kib >= 0 && v_build_ok && cap_ok && gpu_ok && thr_ok) ||
+                        (nP == 0 && headW < 0 && nb == 0))) {
                 granted = true;
-                if (write(btok[1], "x", 1) != 1) { std::perror("[split] btoken"); all_ok = false; break; }
-                ++build_tok; state[headw] = 'b';
+                if (write(btok[1], "x", 1) != 1) {
+                    std::perror("[split] btoken");
+                    all_ok = false;
+                    break;
+                }
+                ++build_tok;
+                state[headw] = 'b';
                 std::cerr << "[split] mem-gated: build slot -> partition " << headw
                           << " (avail=" << avail / 1048576.0 << " GiB owed=" << growth / 1048576.0
-                          << " GiB proving=" << nP << " witgen_cap=" << kcap << " pending=" << nwait + 1 << ")\n";
+                          << " GiB proving=" << nP << " witgen_cap=" << kcap << " pending=" << nwait + 1
+                          << ")\n";
             }
-            if (prof_now_us() - last_tick_us >= 60e6) {       // progress line once a minute
+            if (prof_now_us() - last_tick_us >= 60e6) {  // progress line once a minute
                 last_tick_us = prof_now_us();
-                std::cerr << "[split] mem-gated: t+" << (int)((prof_now_us() - t0) / 1e6) << "s avail=" << avail / 1048576.0
-                          << " GiB owed=" << growth / 1048576.0 << " GiB proving=" << nP
-                          << " pending=" << nwait << " witgen_cap=" << kcap
-                          << " peak_est=" << peak_kib / 1048576.0 << " GiB built_est="
-                          << built_kib / 1048576.0 << " GiB"
-                          << (vram_gate ? " vram_free=" + std::to_string(vfree / 1024) + "MiB vram_owed="
-                              + std::to_string(vgrowth / 1024) + "MiB vprove_est="
-                              + std::to_string(vpeak_kib / 1024) + "MiB vbuild_est="
-                              + std::to_string(vwg_kib / 1024) + "MiB" : std::string())
+                std::cerr << "[split] mem-gated: t+" << (int)((prof_now_us() - t0) / 1e6)
+                          << "s avail=" << avail / 1048576.0 << " GiB owed=" << growth / 1048576.0
+                          << " GiB proving=" << nP << " pending=" << nwait << " witgen_cap=" << kcap
+                          << " peak_est=" << peak_kib / 1048576.0
+                          << " GiB built_est=" << built_kib / 1048576.0 << " GiB"
+                          << (vram_gate ? " vram_free=" + std::to_string(vfree / 1024) +
+                                              "MiB vram_owed=" + std::to_string(vgrowth / 1024) +
+                                              "MiB vprove_est=" + std::to_string(vpeak_kib / 1024) +
+                                              "MiB vbuild_est=" + std::to_string(vwg_kib / 1024) + "MiB"
+                                        : std::string())
                           << "\n";
             }
-            // Event-driven: re-evaluate at once after a grant (its full estimate is
-            // already charged via state[]), else sleep until a child posts a
-            // transition, at most 1 s (exits and MemAvailable drift post nothing).
+            // Event-driven
             if (live > 0 && !granted) {
                 struct pollfd pf{stat[0], POLLIN, 0};
                 poll(&pf, 1, 1000);
             }
         }
-        if (!all_ok)                      // one child died: don't strand the rest in a gate
-            for (int i = 0; i < n; ++i) if (!reaped[i]) kill(pids[i], SIGTERM);
+        if (!all_ok)  // one child died: don't strand the rest in a gate
+            for (int i = 0; i < n; ++i)
+                if (!reaped[i])
+                    kill(pids[i], SIGTERM);
         close(stat[0]);
     }
-    if (mem_gated) { close(btok[0]); close(btok[1]); }
-    for (auto &t : ptok) { close(t[0]); close(t[1]); }
-    close(tok[0]); close(tok[1]);
+    if (mem_gated) {
+        close(btok[0]);
+        close(btok[1]);
+    }
+    for (auto& t : ptok) {
+        close(t[0]);
+        close(t[1]);
+    }
+    close(tok[0]);
+    close(tok[1]);
 
     for (size_t k = 0; k < pids.size(); ++k) {
-        if (k < reaped.size() && reaped[k]) continue;   // already collected by the release loop
+        if (k < reaped.size() && reaped[k])
+            continue;  // already collected by the release loop
         const pid_t pid = pids[k];
         int stt = 0;
-        if (waitpid(pid, &stt, 0) < 0) { std::perror("[split] waitpid"); all_ok = false; continue; }
+        if (waitpid(pid, &stt, 0) < 0) {
+            std::perror("[split] waitpid");
+            all_ok = false;
+            continue;
+        }
         if (!WIFEXITED(stt) || WEXITSTATUS(stt) != 0) {
             std::cerr << "[split] child pid " << pid << " failed (status " << stt << ")\n";
             all_ok = false;
@@ -2098,163 +2052,178 @@ static bool run_split_overlapped(const SplitCfg &cfg, int batch, bool want_witge
     }
     if (ctrl_pid > 0) {
         int stt = 0;
-        if (!all_ok) kill(ctrl_pid, SIGTERM);
+        if (!all_ok)
+            kill(ctrl_pid, SIGTERM);
         if (waitpid(ctrl_pid, &stt, 0) < 0 || !WIFEXITED(stt) || WEXITSTATUS(stt) != 0) {
             std::cerr << "[split] witgen controller failed (status " << stt << ")\n";
             all_ok = false;
         }
     }
     const double total_s = (prof_now_us() - t0) / 1e6;
-    if (ctrl) {                                          // leftovers from a failed run
-        for (int i = 0; i < n; ++i) remove_part_files(wc_dir, i);
+    if (ctrl) {  // leftovers from a failed run
+        for (int i = 0; i < n; ++i)
+            remove_part_files(wc_dir, i);
         ::rmdir(wc_dir.c_str());
     }
 
-    if (barrier) makespan_s = (prof_now_us() - t_release) / 1e6;
+    if (barrier)
+        makespan_s = (prof_now_us() - t_release) / 1e6;
     zkgpt_sampler::stop(sampler);
     report_vram_peak(cfg, t0, prof_now_us(), "witgen_chain");
     munmap(raw, shm_bytes);
     all_ok = link_end("overlapped", all_ok);
 
-    std::cout << "SPLIT_OVERLAPPED parts=" << n
-              << " batch=" << (mem_gated ? -1 : b)
-              << " mem_gated=" << (mem_gated ? 1 : 0)
-              << " threads_per_child=" << tpc
-              << " threads_total=" << cfg.num_threads
-              << " witgen_gpu=" << (want_witgen_gpu ? 1 : 0)
-              << " round_gpu=" << (want_round_gpu ? 1 : 0)
-              << " gates_gpu=" << (want_gates_gpu ? 1 : 0)
-              << " witgen_full=" << (want_witgen_full ? 1 : 0)
-              << " witgen_device=" << (ctrl ? wdev : "-1")
-              << " carry_mib=" << (shm_bytes / 1048576.0)
-              << " barrier=" << (barrier ? 1 : 0)
+    std::cout << "SPLIT_OVERLAPPED parts=" << n << " batch=" << (mem_gated ? -1 : b)
+              << " mem_gated=" << (mem_gated ? 1 : 0) << " threads_per_child=" << tpc
+              << " threads_total=" << cfg.num_threads << " witgen_gpu=" << (want_witgen_gpu ? 1 : 0)
+              << " round_gpu=" << (want_round_gpu ? 1 : 0) << " gates_gpu=" << (want_gates_gpu ? 1 : 0)
+              << " witgen_full=" << (want_witgen_full ? 1 : 0) << " witgen_device=" << (ctrl ? wdev : "-1")
+              << " carry_mib=" << (shm_bytes / 1048576.0) << " barrier=" << (barrier ? 1 : 0)
               << " prep_s=" << (barrier ? prep_s : 0.0)
-              << " barrier_makespan_s=" << (barrier ? makespan_s : 0.0)
-              << " overlapped_total_s=" << total_s
+              << " barrier_makespan_s=" << (barrier ? makespan_s : 0.0) << " overlapped_total_s=" << total_s
               << " status=" << (all_ok ? "OK" : "FAIL") << std::endl;
     return all_ok;
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char** argv) {
     initPairing(mcl::BN254);
-    // The VRAM sampler is started AFTER arg parsing: it spawns a thread, and in
-    // --concurrent the parent must reach fork() with no HIP context and no extra
-    // threads, since neither survives it. Children start their own.
+    // The VRAM sampler is started AFTER arg parsing
 
-    int depth       = 12;
-    int embed_size  = 768;
-    int lin_dim     = -1;       // FFN width; from argv (pos[5]) like the non-split baseline. <=0 => embed*3.
-    int num_splits  = 2;
-    int len         = 30;
+    int depth = 12;
+    int embed_size = 768;
+    int lin_dim = -1;  // FFN width
+    int num_splits = 2;
+    int len = 30;
     int num_threads = 32;
 
-    // Positional: depth embed_size num_splits [len] [threads]. Flags thread sweep
-    // knobs into gkr_config: --c, --matmul-k, --range-k, --range-size, --vram-gb.
-    // Boundary study: --splits a,b,c (overrides num_splits) and per-partition
-    // --cs / --matmul-ks / --range-ks (scalar broadcasts, else index per partition).
+    // Positional: depth embed_size num_splits [len] [threads]
     std::vector<int> explicit_splits, part_cs, part_mks, part_rks, part_lls, part_lks;
-    bool unique_parts = false;   // --unique-parts: prove one block per structural role
-    // --concurrent [W]: prove the partitions in W concurrent child processes.
+    bool unique_parts = false;  // unique-parts: prove one block per structural role
+    // concurrent [W]: prove the partitions in W concurrent child processes
     bool concurrent = false;
-    bool witgen_barrier = false;   // --witgen-barrier: all witgen, THEN all proving
-    // --batched [B]: B = partitions proved concurrently per batch.
+    bool witgen_barrier = false;  // witgen-barrier: all witgen, THEN all proving
+    // batched [B]: B = partitions proved concurrently per batch
     bool pipeline = false;
-    int  pipe_batch = 0;         // 0 => one batch, degenerates to --concurrent
-    // --overlapped [B]: fork before any HIP so children can do GPU witgen.
+    int pipe_batch = 0;  // 0 => one batch, degenerates to --concurrent
+    // overlapped [B]: fork before any HIP so children can do GPU witgen
     bool witgen_chain = false;
-    int  chain_batch = 0;
-    // Deferred: the probe pass below calls fullyConnLayer in THIS process, so
-    // enabling GPU witgen now would give the parent a HIP context and break every
-    // fork. Each mode decides when (and where) to turn it on.
+    int chain_batch = 0;
     const bool want_witgen_gpu = getenv("GKR_WITGEN_GPU") != nullptr;
-    const bool want_round_gpu  = getenv("GKR_ROUND_GPU") != nullptr;
-    const bool want_gates_gpu  = getenv("GKR_GATES_GPU") != nullptr;
-    const bool want_witgen_full = getenv("GKR_WITGEN_FULL") != nullptr
-                               || getenv("GKR_GELU_GPU") != nullptr;
-    gkr_config.witgen_gpu   = false;
-    gkr_config.round_gpu    = false;
-    gkr_config.gates_gpu    = false;
-    gkr_config.witgen_full     = false;
+    const bool want_round_gpu = getenv("GKR_ROUND_GPU") != nullptr;
+    const bool want_gates_gpu = getenv("GKR_GATES_GPU") != nullptr;
+    const bool want_witgen_full = getenv("GKR_WITGEN_FULL") != nullptr || getenv("GKR_GELU_GPU") != nullptr;
+    gkr_config.witgen_gpu = false;
+    gkr_config.round_gpu = false;
+    gkr_config.gates_gpu = false;
+    gkr_config.witgen_full = false;
     gkr_config.witgen_check = getenv("GKR_WITGEN_CHECK") != nullptr;
-    gkr_config.round_check  = getenv("GKR_ROUND_CHECK") != nullptr;
-    gkr_config.gates_check  = getenv("GKR_GATES_CHECK") != nullptr;
-    gkr_config.witgen_full_check = getenv("GKR_WITGEN_FULL_CHECK") != nullptr
-                                || getenv("GKR_GELU_CHECK") != nullptr;
-    bool witgen_only = false;    // --witgen-only : build+cache every partition, skip proving
-    int  conc_width = 0;         // 0 => all partitions at once
-    // --threads-total: host thread budget. The sequential path uses all of it; the
-    // concurrent path splits it across children. Defaults to the positional `threads`
-    // so the two paths are comparable without extra flags.
-    int  threads_total = 0;
+    gkr_config.round_check = getenv("GKR_ROUND_CHECK") != nullptr;
+    gkr_config.gates_check = getenv("GKR_GATES_CHECK") != nullptr;
+    gkr_config.witgen_full_check =
+        getenv("GKR_WITGEN_FULL_CHECK") != nullptr || getenv("GKR_GELU_CHECK") != nullptr;
+    bool witgen_only = false;  // witgen-only : build+cache every partition, skip proving
+    int conc_width = 0;        // 0 => all partitions at once
+    // threads-total: host thread budget
+    int threads_total = 0;
     std::string vram_csv;
     double vram_interval = 0.001;
     {
         std::vector<int> pos;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
-            auto next = [&]{ return (i + 1 < argc) ? atoi(argv[++i]) : 0; };
-            auto next_str = [&]() -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
-            if      (a == "--c")          gkr_config.range_c    = next();
-            else if (a == "--matmul-k")   gkr_config.matmul_k   = next();
-            else if (a == "--range-k")    gkr_config.range_k    = next();
-            else if (a == "--lasso-l")    gkr_config.lasso_l    = next();
-            else if (a == "--lasso-k")    gkr_config.lasso_k    = next();
-            else if (a == "--sc-tile-bits") gkr_config.sc_tile_bits = next();
-            // Per-phase CPU reference paths; they are how
-            // each GPU offload below gets A/B'd.
-            else if (a == "--cpu")        gkr_config.range_cpu  = true;
-            else if (a == "--cpu-deg3")   gkr_config.deg3_cpu   = true;
-            else if (a == "--cpu-open")   gkr_config.open_cpu   = true;
-            else if (a == "--cpu-commit") gkr_config.commit_cpu = true;
-            else if (a == "--partitions") gkr_config.range_partitions = next();
-            else if (a == "--vram-gb")    gkr_config.vram_gb = (i + 1 < argc) ? atof(argv[++i]) : 64.0f;
-            else if (a == "--splits")     explicit_splits = parse_int_csv(next_str());
-            else if (a == "--cs")         part_cs         = parse_int_csv(next_str());
-            else if (a == "--matmul-ks")  part_mks        = parse_int_csv(next_str());
-            else if (a == "--range-ks")   part_rks        = parse_int_csv(next_str());
-            else if (a == "--lasso-ls")   part_lls        = parse_int_csv(next_str());
-            else if (a == "--lasso-ks")   part_lks        = parse_int_csv(next_str());
-            else if (a == "--unique-parts") unique_parts   = true;
-            else if (a == "--witgen-only")       witgen_only       = true;
-            else if (a == "--uvm-prefetch") gkr_config.uvm_prefetch = true;
+            auto next = [&] { return (i + 1 < argc) ? atoi(argv[++i]) : 0; };
+            auto next_str = [&]() -> std::string {
+                return (i + 1 < argc) ? std::string(argv[++i]) : std::string();
+            };
+            if (a == "--c")
+                gkr_config.range_c = next();
+            else if (a == "--matmul-k")
+                gkr_config.matmul_k = next();
+            else if (a == "--range-k")
+                gkr_config.range_k = next();
+            else if (a == "--lasso-l")
+                gkr_config.lasso_l = next();
+            else if (a == "--lasso-k")
+                gkr_config.lasso_k = next();
+            else if (a == "--sc-tile-bits")
+                gkr_config.sc_tile_bits = next();
+            // Per-phase CPU reference paths
+            else if (a == "--cpu")
+                gkr_config.range_cpu = true;
+            else if (a == "--cpu-deg3")
+                gkr_config.deg3_cpu = true;
+            else if (a == "--cpu-open")
+                gkr_config.open_cpu = true;
+            else if (a == "--cpu-commit")
+                gkr_config.commit_cpu = true;
+            else if (a == "--partitions")
+                gkr_config.range_partitions = next();
+            else if (a == "--vram-gb")
+                gkr_config.vram_gb = (i + 1 < argc) ? atof(argv[++i]) : 64.0f;
+            else if (a == "--splits")
+                explicit_splits = parse_int_csv(next_str());
+            else if (a == "--cs")
+                part_cs = parse_int_csv(next_str());
+            else if (a == "--matmul-ks")
+                part_mks = parse_int_csv(next_str());
+            else if (a == "--range-ks")
+                part_rks = parse_int_csv(next_str());
+            else if (a == "--lasso-ls")
+                part_lls = parse_int_csv(next_str());
+            else if (a == "--lasso-ks")
+                part_lks = parse_int_csv(next_str());
+            else if (a == "--unique-parts")
+                unique_parts = true;
+            else if (a == "--witgen-only")
+                witgen_only = true;
+            else if (a == "--uvm-prefetch")
+                gkr_config.uvm_prefetch = true;
             else if (a == "--concurrent") {
                 concurrent = true;
-                if (i + 1 < argc && argv[i + 1][0] != '-') conc_width = atoi(argv[++i]);
+                if (i + 1 < argc && argv[i + 1][0] != '-')
+                    conc_width = atoi(argv[++i]);
             }
-            // --pipeline / --witgen-chain are the original spellings, kept as
-            // aliases so older scripts still run. The names were backwards in
-            // effect: at width == nparts "--pipeline" has a single group and
-            // pipelines nothing, while the chain is the mode that actually
-            // overlaps witgen with proving.
+            // pipeline / --witgen-chain are the original spellings
             else if (a == "--batched" || a == "--pipeline") {
                 pipeline = true;
-                if (i + 1 < argc && argv[i + 1][0] != '-') pipe_batch = atoi(argv[++i]);
-            }
-            else if (a == "--witgen-barrier") { witgen_barrier = true; }
-            else if (a == "--overlapped" || a == "--witgen-chain") {
+                if (i + 1 < argc && argv[i + 1][0] != '-')
+                    pipe_batch = atoi(argv[++i]);
+            } else if (a == "--witgen-barrier") {
+                witgen_barrier = true;
+            } else if (a == "--overlapped" || a == "--witgen-chain") {
                 witgen_chain = true;
-                // Accept a bare number OR a negative one ("-1" = memory-gated mode,
-                // see run_split_overlapped); the generic "starts with '-' so it's
-                // the next flag" test would otherwise reject "-1" as an unknown arg.
-                if (i + 1 < argc && (argv[i + 1][0] != '-' ||
-                                     (argv[i + 1][1] && isdigit((unsigned char)argv[i + 1][1]))))
+                // Accept a bare number OR a negative one
+                if (i + 1 < argc &&
+                    (argv[i + 1][0] != '-' || (argv[i + 1][1] && isdigit((unsigned char)argv[i + 1][1]))))
                     chain_batch = atoi(argv[++i]);
+            } else if (a == "--threads-total")
+                threads_total = next();
+            else if (a == "--vram-csv")
+                vram_csv = next_str();
+            else if (a == "--vram-interval")
+                vram_interval = (i + 1 < argc) ? atof(argv[++i]) : 0.001;
+            else if (!a.empty() && a[0] != '-')
+                pos.push_back(atoi(a.c_str()));
+            else {
+                std::cerr << "unknown arg: " << a << "\n";
+                return EXIT_FAILURE;
             }
-            else if (a == "--threads-total") threads_total = next();
-            else if (a == "--vram-csv")      vram_csv      = next_str();
-            else if (a == "--vram-interval") vram_interval = (i + 1 < argc) ? atof(argv[++i]) : 0.001;
-            else if (!a.empty() && a[0] != '-') pos.push_back(atoi(a.c_str()));
-            else { std::cerr << "unknown arg: " << a << "\n"; return EXIT_FAILURE; }
         }
-        if (pos.size() >= 1) depth       = pos[0];
-        if (pos.size() >= 2) embed_size  = pos[1];
-        if (pos.size() >= 3) num_splits  = pos[2];
-        if (pos.size() >= 4) len         = pos[3];
-        if (pos.size() >= 5) num_threads = pos[4];
-        if (pos.size() >= 6) lin_dim     = pos[5];   // FFN width (like the non-split baseline's lin_dim arg)
+        if (pos.size() >= 1)
+            depth = pos[0];
+        if (pos.size() >= 2)
+            embed_size = pos[1];
+        if (pos.size() >= 3)
+            num_splits = pos[2];
+        if (pos.size() >= 4)
+            len = pos[3];
+        if (pos.size() >= 5)
+            num_threads = pos[4];
+        if (pos.size() >= 6)
+            lin_dim = pos[5];  // FFN width (like the non-split baseline's lin_dim arg)
     }
-    if (lin_dim <= 0) lin_dim = embed_size * 3;      // back-compat default when omitted
+    if (lin_dim <= 0)
+        lin_dim = embed_size * 3;  // back-compat default when omitted
 
     if (depth <= 0 || num_splits < 1) {
         std::cerr << "Usage: main_gkr_split <depth> <embed_size> <num_splits> [len] [threads] [lin_dim]"
@@ -2263,15 +2232,19 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Boundary composition: explicit --splits (arbitrary, parts sum to depth) or
-    // the even-division default from num_splits.
+    // Boundary composition
     std::vector<int> split_depths;
     if (!explicit_splits.empty()) {
-        int sum = 0; bool bad = false;
-        for (int d : explicit_splits) { if (d < 1) bad = true; sum += d; }
+        int sum = 0;
+        bool bad = false;
+        for (int d : explicit_splits) {
+            if (d < 1)
+                bad = true;
+            sum += d;
+        }
         if (bad || sum != depth) {
-            std::cerr << "--splits must be positive ints summing to depth=" << depth
-                      << " (got sum=" << sum << ")\n";
+            std::cerr << "--splits must be positive ints summing to depth=" << depth << " (got sum=" << sum
+                      << ")\n";
             return EXIT_FAILURE;
         }
         split_depths = explicit_splits;
@@ -2279,64 +2252,64 @@ int main(int argc, char **argv)
     } else {
         num_splits = std::max(1, std::min(depth, num_splits));
         split_depths.assign(num_splits, depth / num_splits);
-        for (int i = 0; i < depth % num_splits; ++i) ++split_depths[i];
+        for (int i = 0; i < depth % num_splits; ++i)
+            ++split_depths[i];
     }
 
-    for (const auto *v : {&part_cs, &part_mks, &part_rks})
+    for (const auto* v : {&part_cs, &part_mks, &part_rks})
         if (!v->empty() && v->size() != 1 && (int)v->size() != num_splits)
-            std::cerr << "[split] warning: per-partition knob vector size " << v->size()
-                      << " != #partitions " << num_splits << " (clamping to last)\n";
+            std::cerr << "[split] warning: per-partition knob vector size " << v->size() << " != #partitions "
+                      << num_splits << " (clamping to last)\n";
 
-    std::cerr << "[split] depth=" << depth << " embed=" << embed_size
-              << " lin=" << lin_dim
-              << " splits=" << num_splits << " len=" << len
-              << " threads=" << num_threads << " split_depths:";
-    for (auto d : split_depths) std::cerr << ' ' << d;
+    std::cerr << "[split] depth=" << depth << " embed=" << embed_size << " lin=" << lin_dim
+              << " splits=" << num_splits << " len=" << len << " threads=" << num_threads << " split_depths:";
+    for (auto d : split_depths)
+        std::cerr << ' ' << d;
     std::cerr << std::endl;
 
-    // ── circuit geometry ─────────────────────────────────────────────────────
-    // The circuit width is next_pow2(len).
     {
-        int w = 1; while (w < len) w <<= 1;
+        int w = 1;
+        while (w < len)
+            w <<= 1;
         len = w;
     }
     std::cerr << "[split] len=" << len << " merge=" << kMerge << std::endl;
 
-    // Probe pass: build each block's circuit (no commit) for total_input_witness_size
-    // and shared_commit_sizes. Memoised on split_depth.
     std::map<int, long long> probe_cache;
-    // The probe's one output depends only on the block geometry, so it is also kept on
-    // disk across runs: GKR_PROBE_CACHE=<dir> (default ~/.cache/zkml_probe), =0 disables.
-    // A hit skips the pass (tens of minutes for a monolith at len >= 128).
+    // The probe's one output depends only on the block geometry
     const std::string probe_dir = [] {
-        const char *e = getenv("GKR_PROBE_CACHE");
-        if (e) return std::string(strcmp(e, "0") ? e : "");
-        const char *h = getenv("HOME");
+        const char* e = getenv("GKR_PROBE_CACHE");
+        if (e)
+            return std::string(strcmp(e, "0") ? e : "");
+        const char* h = getenv("HOME");
         return h ? std::string(h) + "/.cache/zkml_probe" : std::string();
     }();
     auto probe_file = [&](int d) {
         return probe_dir + "/d" + std::to_string(d) + "_e" + std::to_string(embed_size) + "_l" +
                std::to_string(lin_dim) + "_len" + std::to_string(len) + "_m" + std::to_string(kMerge);
     };
-    auto probe_load = [&](int d, long long &v) {
-        if (probe_dir.empty()) return false;
+    auto probe_load = [&](int d, long long& v) {
+        if (probe_dir.empty())
+            return false;
         std::ifstream f(probe_file(d));
         return bool(f >> v) && v > 0;
     };
     auto probe_store = [&](int d, long long v) {
-        if (probe_dir.empty()) return;
+        if (probe_dir.empty())
+            return;
         mkdir(probe_dir.c_str(), 0750);
         const std::string p = probe_file(d), tmp = p + ".tmp" + std::to_string(getpid());
-        { std::ofstream f(tmp); f << v << "\n"; if (!f) return; }
+        {
+            std::ofstream f(tmp);
+            f << v << "\n";
+            if (!f)
+                return;
+        }
         rename(tmp.c_str(), p.c_str());
     };
-    auto probe_boundary_sizes = [&](std::vector<long long> &tiws, std::vector<u64> &scs) {
+    auto probe_boundary_sizes = [&](std::vector<long long>& tiws, std::vector<u64>& scs) {
         tiws.assign(num_splits, 0);
         scs.assign(num_splits > 1 ? num_splits - 1 : 0, 0);
-        // Probes at splits=1 as well: modular-zkp's monolithic demo does
-        // (nn_test.create -> getTotalInputSize -> setTotalInputWitnessSize), so the
-        // monolith gets the same 2*pow2(input+aux) half/half layout as its partitions
-        // and the baseline differs from the paths in the split count only.
         for (int i = 0; i < num_splits; ++i) {
             const int key = split_depths[i];
             auto it = probe_cache.find(key);
@@ -2346,36 +2319,37 @@ int main(int argc, char **argv)
                 it = probe_cache.emplace(key, cached).first;
             }
             if (it == probe_cache.end()) {
-                // The probe pass is a full witgen per partition -- the whole leading
-                // segment of a run's wall clock, which without a marker reads as dead
-                // time before partition 0 starts. Tagged with the partition it probes;
-                // the phase name is what separates it from that partition's real build.
+                // The probe pass is a full witgen per partition
                 zkgpt_phase::set_part(i);
                 ZKGPT_PHASE_SCOPE("probe_witgen");
-                // Run in a forked child with the full thread budget (cpu_threads comes off
-                // probe_p.max_threads, 1 when unset). The child keeps the parent free of an
-                // OpenMP pool, which libgomp does not carry safely across the later forks,
-                // and of the probe's memory.
+                // Run in a forked child with the full thread budget
                 int fds[2];
-                if (pipe(fds) != 0) { perror("probe pipe"); exit(EXIT_FAILURE); }
-                std::cout.flush(); std::cerr.flush(); fflush(nullptr);
+                if (pipe(fds) != 0) {
+                    perror("probe pipe");
+                    exit(EXIT_FAILURE);
+                }
+                std::cout.flush();
+                std::cerr.flush();
+                fflush(nullptr);
                 const pid_t pid = fork();
-                if (pid < 0) { perror("probe fork"); exit(EXIT_FAILURE); }
+                if (pid < 0) {
+                    perror("probe fork");
+                    exit(EXIT_FAILURE);
+                }
                 if (pid == 0) {
                     close(fds[0]);
-                    // all-false flags: a private/separate
-                    // input would take initParam's half/half branch with the default
-                    // 2*pow2(prompt) size and refuse the weights. No commit happens here.
+                    // all-false flags
                     prover probe_p;
                     probe_p.max_threads = num_threads;
                     std::unique_ptr<neuralNetwork> probe_nn(
-                        new LLMSplitBlock(split_depths[i], embed_size / 64, 64,
-                                          embed_size, lin_dim, len,
+                        new LLMSplitBlock(split_depths[i], embed_size / 64, 64, embed_size, lin_dim, len,
                                           false, false, false, nullptr, nullptr));
                     timer probe_circuit_timer;
                     probe_nn->create(probe_p, kMerge, probe_circuit_timer);
                     const long long v = probe_nn->getTotalInputSize();
-                    std::cout.flush(); std::cerr.flush(); fflush(nullptr);
+                    std::cout.flush();
+                    std::cerr.flush();
+                    fflush(nullptr);
                     _exit(write(fds[1], &v, sizeof v) == (ssize_t)sizeof v ? 0 : 1);
                 }
                 close(fds[1]);
@@ -2392,15 +2366,14 @@ int main(int argc, char **argv)
                 probe_store(key, it->second);
             }
             tiws[i] = it->second;
-            std::cout << "Block " << (i + 1)
-                      << " total_input_witness_size (probe): " << tiws[i] << std::endl;
+            std::cout << "Block " << (i + 1) << " total_input_witness_size (probe): " << tiws[i] << std::endl;
 
             if (i > 0) {
                 u64 shared = next_pow2_size(static_cast<u64>(tiws[i] >> 1));
                 scs[i - 1] = shared;
                 tiws[i] = static_cast<long long>(shared << 1);
-                std::cout << "Shared commitment size blocks " << i << "-" << (i + 1)
-                          << ": " << shared << std::endl;
+                std::cout << "Shared commitment size blocks " << i << "-" << (i + 1) << ": " << shared
+                          << std::endl;
             }
         }
         zkgpt_phase::set_part(-1);
@@ -2413,27 +2386,30 @@ int main(int argc, char **argv)
 
     SplitCfg cfg;
     cfg.split_depths = split_depths;
-    cfg.tiws         = total_input_witness_sizes;
-    cfg.scs          = shared_commit_sizes;
-    cfg.scs.resize(num_splits, 0);      // scs[last] is never read; keep indexing uniform
-    cfg.embed_size   = embed_size;
-    cfg.lin_dim      = lin_dim;
-    cfg.len          = len;
-    cfg.num_threads  = num_threads;
-    cfg.part_cs = part_cs; cfg.part_mks = part_mks; cfg.part_rks = part_rks;
-    cfg.part_lls = part_lls; cfg.part_lks = part_lks;
-    // Snapshot before any partition mutates gkr_config, so an empty knob vector means
-    // "the value the user passed" and not "whatever the previous partition left".
-    cfg.def_c  = gkr_config.range_c;  cfg.def_mk = gkr_config.matmul_k;
-    cfg.def_rk = gkr_config.range_k;  cfg.def_ll = gkr_config.lasso_l;
+    cfg.tiws = total_input_witness_sizes;
+    cfg.scs = shared_commit_sizes;
+    cfg.scs.resize(num_splits, 0);  // scs[last] is never read
+    cfg.embed_size = embed_size;
+    cfg.lin_dim = lin_dim;
+    cfg.len = len;
+    cfg.num_threads = num_threads;
+    cfg.part_cs = part_cs;
+    cfg.part_mks = part_mks;
+    cfg.part_rks = part_rks;
+    cfg.part_lls = part_lls;
+    cfg.part_lks = part_lks;
+    // Snapshot before any partition mutates gkr_config
+    cfg.def_c = gkr_config.range_c;
+    cfg.def_mk = gkr_config.matmul_k;
+    cfg.def_rk = gkr_config.range_k;
+    cfg.def_ll = gkr_config.lasso_l;
     cfg.def_lk = gkr_config.lasso_k;
-    if (threads_total > 0) cfg.num_threads = threads_total;
-    // The whole process -- monolith and split parent alike -- stays inside the thread budget:
-    // OpenMP's default team (pragmas without num_threads, hyrax compute_RT) is otherwise the
-    // affinity mask, 384 logical CPUs. Forked children narrow it further to their tpc share.
+    if (threads_total > 0)
+        cfg.num_threads = threads_total;
+    // The whole process
     omp_set_num_threads(std::max(1, cfg.num_threads));
-    cfg.witgen_only       = witgen_only;
-    cfg.vram_csv      = vram_csv;
+    cfg.witgen_only = witgen_only;
+    cfg.vram_csv = vram_csv;
     cfg.vram_interval = vram_interval;
 
     bool ok;
@@ -2446,11 +2422,11 @@ int main(int argc, char **argv)
             std::cerr << "--overlapped needs at least 2 partitions\n";
             return EXIT_FAILURE;
         }
-        // gkr_config.witgen_gpu stays false here; each child sets it after fork.
-        return run_split_overlapped(cfg, chain_batch, want_witgen_gpu, want_round_gpu,
-                                    want_gates_gpu, want_witgen_full,
-                                   witgen_barrier)
-                   ? EXIT_SUCCESS : EXIT_FAILURE;
+        // gkr_config.witgen_gpu stays false here
+        return run_split_overlapped(cfg, chain_batch, want_witgen_gpu, want_round_gpu, want_gates_gpu,
+                                    want_witgen_full, witgen_barrier)
+                   ? EXIT_SUCCESS
+                   : EXIT_FAILURE;
     }
     if (pipeline) {
         if (concurrent || unique_parts || witgen_only) {
@@ -2461,8 +2437,7 @@ int main(int argc, char **argv)
             std::cerr << "--batched needs at least 2 partitions\n";
             return EXIT_FAILURE;
         }
-        // The parent builds, so GPU witgen would give it a HIP context before fork();
-        // children then SIGSEGV (verified: status 139 on every child).
+        // The parent builds, so GPU witgen would give it a HIP context before fork()
         if (want_witgen_gpu || want_gates_gpu || want_witgen_full) {
             std::cerr << "--batched is incompatible with GKR_WITGEN_GPU/GKR_GATES_GPU: the parent "
                          "builds, so it would hold a HIP context at fork() and every "
@@ -2487,29 +2462,26 @@ int main(int argc, char **argv)
                          "--unique-parts deliberately emits an invalid proof\n";
             return EXIT_FAILURE;
         }
-        // Teardown happens per-child; the parent never initialised HIP.
+        // Teardown happens per-child
         return run_split_concurrent(cfg, conc_width) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
-    // Sequential mode never forks, so GPU witgen is safe from here on.
     gkr_config.witgen_gpu = want_witgen_gpu;
-    gkr_config.round_gpu  = want_round_gpu;
-    gkr_config.gates_gpu  = want_gates_gpu;
-    gkr_config.witgen_full   = want_witgen_full;
-    zkgpt_gpu::gkr_vram_peak_start();   // background device-VRAM high-water sampler
-    // Same device-wide sampler as the concurrent path, so both modes report one
-    // comparable aggregate rather than the per-process figure in the PARTITION line.
-    const pid_t seq_sampler = cfg.vram_csv.empty()
-        ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
+    gkr_config.round_gpu = want_round_gpu;
+    gkr_config.gates_gpu = want_gates_gpu;
+    gkr_config.witgen_full = want_witgen_full;
+    zkgpt_gpu::gkr_vram_peak_start();  // background device-VRAM high-water sampler
+    // Same device-wide sampler as the concurrent path
+    const pid_t seq_sampler =
+        cfg.vram_csv.empty() ? -1 : zkgpt_sampler::start(cfg.vram_csv, cfg.vram_interval, prof_now_us);
     const double t_seq0 = prof_now_us();
     ok = run_split_sequential(cfg, unique_parts);
     const double t_seq1 = prof_now_us();
     zkgpt_sampler::stop(seq_sampler);
     report_vram_peak(cfg, t_seq0, t_seq1, "sequential");
     // gkr_sc_end keeps its device buffers alive across layers AND across partitions
-    // (grow-only); release them once the whole split run is done.
     gkr_sc_teardown();
     gkr_pred_report();
     gkr_pred_teardown();
-    zkgpt_gpu::gkr_vram_peak_stop();   // join sampler while the HIP runtime is still alive
+    zkgpt_gpu::gkr_vram_peak_stop();  // join sampler while the HIP runtime is still alive
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

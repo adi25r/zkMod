@@ -198,8 +198,6 @@ grep -rhoE 'getenv\("[A-Za-z_0-9]+"\)' src gpu_provers witgen_gpu | sed 's/geten
 | `GKR_CHECK_RESERVE` | Check the witness reservation |
 | `GKR_SC_STREAM_PAIRS`, `GKR_SC_FORCE_STREAM` | Force streamed GKR rounds on small models |
 
-`GKR_LASSO_SPARSE_CHECK` appears in a comment in `gpu_lasso_sparse.hpp`, and no code reads it.
-
 ### Profiling and tracing
 
 | Variable | Output |

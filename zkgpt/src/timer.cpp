@@ -7,8 +7,7 @@
 
 using namespace std;
 
-void timer::start() 
-{
+void timer::start() {
     assert(status == false);
     t0 = clock::now();
     if (!has_first_start) {
@@ -18,7 +17,7 @@ void timer::start()
     status = true;
 }
 
-void timer::merge_timer(timer_range val){
+void timer::merge_timer(timer_range val) {
     if (val.ready) {
         if (merge_valid)
             merged_range = combine_ranges({val, merged_range});
@@ -29,8 +28,7 @@ void timer::merge_timer(timer_range val){
     }
 }
 
-void timer::stop(const char* output,bool total,bool restart) 
-{
+void timer::stop(const char* output, bool total, bool restart) {
     assert(status == true);
     auto t1 = clock::now();
     auto time_span_sec = std::chrono::duration_cast<std::chrono::duration<double>>(t1 - t0);
@@ -38,20 +36,18 @@ void timer::stop(const char* output,bool total,bool restart)
     last_stop_time = t1;
     has_last_stop = true;
     status = false;
-    if(strlen(output)>0)
-    {
-        if(total)
-            cout<<output<<" time: "<<total_time_sec<<endl;
+    if (strlen(output) > 0) {
+        if (total)
+            cout << output << " time: " << total_time_sec << endl;
         else
-            cout<<output<<" time: "<<time_span_sec.count()<<endl;
+            cout << output << " time: " << time_span_sec.count() << endl;
     }
-    if(restart)
+    if (restart)
         start();
 }
-void timer::stop()
-{
-    stop("",true,false);
-} 
+void timer::stop() {
+    stop("", true, false);
+}
 
 timer::time_point timer::firstStartTime() const {
     assert(has_first_start);
@@ -81,21 +77,22 @@ timer_range timer::range() const {
         result.start_epoch_sec = toEpochSeconds(first_start_time);
         result.end_epoch_sec = toEpochSeconds(last_stop_time);
     }
-    if(merge_valid)
-        return combine_ranges({result,merged_range});
+    if (merge_valid)
+        return combine_ranges({result, merged_range});
     else
         return result;
 }
 
-double timer::toEpochSeconds(const time_point &tp) {
+double timer::toEpochSeconds(const time_point& tp) {
     return std::chrono::duration_cast<std::chrono::duration<double>>(tp.time_since_epoch()).count();
 }
 
-timer_range combine_ranges(const std::vector<timer_range> &ranges) {
+timer_range combine_ranges(const std::vector<timer_range>& ranges) {
     timer_range combined;
     bool has_value = false;
-    for (const auto &range : ranges) {
-        if (!range.ready) continue;
+    for (const auto& range : ranges) {
+        if (!range.ready)
+            continue;
         combined.duration_sec += range.duration_sec;
         has_value = true;
     }
@@ -111,14 +108,14 @@ timer_range combine_ranges(std::initializer_list<timer_range> ranges) {
     return combine_ranges(std::vector<timer_range>(ranges));
 }
 
-std::string format_range(const timer_range &range) {
-    if (!range.ready) return "";
+std::string format_range(const timer_range& range) {
+    if (!range.ready)
+        return "";
     std::ostringstream oss;
-    oss << std::fixed << std::setprecision(6)
-        << range.start_epoch_sec << "," << range.end_epoch_sec;
+    oss << std::fixed << std::setprecision(6) << range.start_epoch_sec << "," << range.end_epoch_sec;
     return oss.str();
 }
 
-double range_duration(const timer_range &range) {
+double range_duration(const timer_range& range) {
     return range.ready ? range.duration_sec : 0.0;
 }

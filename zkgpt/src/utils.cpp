@@ -1,6 +1,4 @@
-//
-// Created by 69029 on 3/9/2021.
-//
+// Created by 69029 on 3/9/2021
 
 #include <cmath>
 #include <iostream>
@@ -11,22 +9,22 @@
 #include "utils.hpp"
 
 using std::cerr;
+using std::cin;
 using std::endl;
 using std::string;
-using std::cin;
 
 int ceilPow2BitLengthSigned(double n) {
-    return (i8) ceil(log2(n));
+    return (i8)ceil(log2(n));
 }
 
 int floorPow2BitLengthSigned(double n) {
-    return (i8) floor(log2(n));
+    return (i8)floor(log2(n));
 }
 
-i8 ceilPow2BitLength(u32 n)
-{
-    if (n == 0) return -1;
-    // ceil(log2(n)) using integer ops avoids rounding errors from std::log.
+i8 ceilPow2BitLength(u32 n) {
+    if (n == 0)
+        return -1;
+    // ceil(log2(n)) using integer ops avoids rounding errors from std::log
     --n;
     i8 l = 0;
     while (n) {
@@ -36,9 +34,9 @@ i8 ceilPow2BitLength(u32 n)
     return l;
 }
 
-i8 ceilPow2BitLength64(i64 n)
-{
-    if (n <= 0) return -1;
+i8 ceilPow2BitLength64(i64 n) {
+    if (n <= 0)
+        return -1;
     i64 m = n - 1;
     i8 l = 0;
     while (m) {
@@ -48,9 +46,9 @@ i8 ceilPow2BitLength64(i64 n)
     return l;
 }
 
-i8 floorPow2BitLength(u32 n) 
-{
-    if (n == 0) return -1;
+i8 floorPow2BitLength(u32 n) {
+    if (n == 0)
+        return -1;
     i8 l = -1;
     while (n) {
         n >>= 1U;
@@ -59,13 +57,12 @@ i8 floorPow2BitLength(u32 n)
     return l;
 }
 
-void initHalfTable(vector<F> &beta_f, vector<F> &beta_s, const vector<F>::const_iterator &r, const F &init, u32 first_half, u32 second_half) {
+void initHalfTable(vector<F>& beta_f, vector<F>& beta_s, const vector<F>::const_iterator& r, const F& init,
+                   u32 first_half, u32 second_half) {
     beta_f.at(0) = init;
     beta_s.at(0) = F_ONE;
-    for (u32 i = 0; i < first_half; ++i) 
-    {
-        for (u32 j = 0; j < (1ULL << i); ++j) 
-        {
+    for (u32 i = 0; i < first_half; ++i) {
+        for (u32 j = 0; j < (1ULL << i); ++j) {
             auto tmp = beta_f.at(j) * r[i];
             beta_f.at(j | (1ULL << i)) = tmp;
             beta_f.at(j) = beta_f[j] - tmp;
@@ -80,149 +77,130 @@ void initHalfTable(vector<F> &beta_f, vector<F> &beta_s, const vector<F>::const_
     }
 }
 
-
-
-
-void initBetaTable_worker(vector<F> &beta_g,const vector<F> &beta_f,const vector<F> &beta_s,int first_half,u32 mask_fhalf,size_t start,size_t end)
-{
-    for (size_t kp = start; kp < end; ++kp)
-    {
+void initBetaTable_worker(vector<F>& beta_g, const vector<F>& beta_f, const vector<F>& beta_s, int first_half,
+                          u32 mask_fhalf, size_t start, size_t end) {
+    for (size_t kp = start; kp < end; ++kp) {
         beta_g[kp] = beta_f[kp & mask_fhalf] * beta_s[kp >> first_half];
     }
 }
-void initBetaTable_worker2(vector<F> &beta_g,const vector<F> &beta_f,const vector<F> &beta_s,int first_half,u32 mask_fhalf,size_t start,size_t end)
-{
-    for (size_t kp = start; kp < end; ++kp)
-    {
+void initBetaTable_worker2(vector<F>& beta_g, const vector<F>& beta_f, const vector<F>& beta_s,
+                           int first_half, u32 mask_fhalf, size_t start, size_t end) {
+    for (size_t kp = start; kp < end; ++kp) {
         beta_g[kp] += beta_f[kp & mask_fhalf] * beta_s[kp >> first_half];
     }
 }
-void initBetaTable(vector<F> &beta_g, u8 gLength, const vector<F>::const_iterator &r_0, const vector<F>::const_iterator &r_1,
-              const F &alpha, const F &beta,int thd) 
-{
+void initBetaTable(vector<F>& beta_g, u8 gLength, const vector<F>::const_iterator& r_0,
+                   const vector<F>::const_iterator& r_1, const F& alpha, const F& beta, int thd) {
     u8 first_half = gLength >> 1, second_half = gLength - first_half;
     u32 mask_fhalf = (1ULL << first_half) - 1;
 
     vector<F> beta_f(1ULL << first_half), beta_s(1ULL << second_half);
     if (!beta.isZero()) {
         initHalfTable(beta_f, beta_s, r_1, beta, first_half, second_half);
-        if(thd==1 || gLength<15)
-        {
+        if (thd == 1 || gLength < 15) {
             for (size_t i = 0; i < (1ULL << gLength); ++i)
                 beta_g[i] = beta_f[i & mask_fhalf] * beta_s[i >> first_half];
-        }
-        else
-        {
+        } else {
             std::vector<std::thread> threads;
             threads.reserve(thd);
-            // size_t, not int: gLength reaches 31 on 24-layer models and an int
-            // `1 << 31` is INT_MIN, which leaves beta_g silently unfilled.
             const size_t total_work = size_t(1) << gLength;
             const size_t chunk = (total_work + thd - 1) / thd;
-            for(int j=0;j<thd;j++)
-            {
+            for (int j = 0; j < thd; j++) {
                 size_t start = size_t(j) * chunk;
                 size_t end = std::min(total_work, start + chunk);
-                if (start >= end) break;
-                threads.emplace_back(initBetaTable_worker,std::ref(beta_g),std::cref(beta_f),std::cref(beta_s),first_half,mask_fhalf,start,end);
+                if (start >= end)
+                    break;
+                threads.emplace_back(initBetaTable_worker, std::ref(beta_g), std::cref(beta_f),
+                                     std::cref(beta_s), first_half, mask_fhalf, start, end);
             }
-            for (auto& t : threads) t.join();
+            for (auto& t : threads)
+                t.join();
         }
-    } else for (size_t i = 0; i < (1ULL << gLength); ++i)
-        beta_g[i].clear();
+    } else
+        for (size_t i = 0; i < (1ULL << gLength); ++i)
+            beta_g[i].clear();
 
-    if (alpha.isZero()) return;
+    if (alpha.isZero())
+        return;
     initHalfTable(beta_f, beta_s, r_0, alpha, first_half, second_half);
-    if(thd==1 || gLength<15)
-    {
+    if (thd == 1 || gLength < 15) {
         for (size_t i = 0; i < (1ULL << gLength); ++i)
             beta_g[i] += beta_f[i & mask_fhalf] * beta_s[i >> first_half];
-    }
-    else
-        {
-            std::vector<std::thread> threads;
-            threads.reserve(thd);
-            // size_t, not int: gLength reaches 31 on 24-layer models and an int
-            // `1 << 31` is INT_MIN, which leaves beta_g silently unfilled.
-            const size_t total_work = size_t(1) << gLength;
-            const size_t chunk = (total_work + thd - 1) / thd;
-            for(int j=0;j<thd;j++)
-            {
-                size_t start = size_t(j) * chunk;
-                size_t end = std::min(total_work, start + chunk);
-                if (start >= end) break;
-                threads.emplace_back(initBetaTable_worker2,std::ref(beta_g),std::cref(beta_f),std::cref(beta_s),first_half,mask_fhalf,start,end);
-            }
-            for (auto& t : threads) t.join();
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(thd);
+        const size_t total_work = size_t(1) << gLength;
+        const size_t chunk = (total_work + thd - 1) / thd;
+        for (int j = 0; j < thd; j++) {
+            size_t start = size_t(j) * chunk;
+            size_t end = std::min(total_work, start + chunk);
+            if (start >= end)
+                break;
+            threads.emplace_back(initBetaTable_worker2, std::ref(beta_g), std::cref(beta_f),
+                                 std::cref(beta_s), first_half, mask_fhalf, start, end);
         }
+        for (auto& t : threads)
+            t.join();
+    }
 }
 
-
-void initBetaTable(vector<F> &beta_g, u8 gLength, const vector<F>::const_iterator &r, const F &init,int thd) 
-{
-    if (gLength == -1) 
+void initBetaTable(vector<F>& beta_g, u8 gLength, const vector<F>::const_iterator& r, const F& init,
+                   int thd) {
+    if (gLength == -1)
         return;
     int first_half = gLength >> 1, second_half = gLength - first_half;
     u32 mask_fhalf = (1ULL << first_half) - 1;
     vector<F> beta_f(1ULL << first_half), beta_s(1ULL << second_half);
-    if (!init.isZero()) 
-    {
+    if (!init.isZero()) {
         initHalfTable(beta_f, beta_s, r, init, first_half, second_half);
-        if(thd==1 || gLength<15)
-        {
+        if (thd == 1 || gLength < 15) {
             for (size_t i = 0; i < (1ULL << gLength); ++i)
                 beta_g[i] = beta_f[i & mask_fhalf] * beta_s[i >> first_half];
-        }
-        else
-        {
+        } else {
             std::vector<std::thread> threads;
             threads.reserve(thd);
-            // size_t, not int: gLength reaches 31 on 24-layer models and an int
-            // `1 << 31` is INT_MIN, which leaves beta_g silently unfilled.
             const size_t total_work = size_t(1) << gLength;
             const size_t chunk = (total_work + thd - 1) / thd;
-            for(int j=0;j<thd;j++)
-            {
+            for (int j = 0; j < thd; j++) {
                 size_t start = size_t(j) * chunk;
                 size_t end = std::min(total_work, start + chunk);
-                if (start >= end) break;
-                threads.emplace_back(initBetaTable_worker,std::ref(beta_g),std::cref(beta_f),std::cref(beta_s),first_half,mask_fhalf,start,end);
+                if (start >= end)
+                    break;
+                threads.emplace_back(initBetaTable_worker, std::ref(beta_g), std::cref(beta_f),
+                                     std::cref(beta_s), first_half, mask_fhalf, start, end);
             }
-            for (auto& t : threads) t.join();
+            for (auto& t : threads)
+                t.join();
         }
-    } 
-    else for (size_t i = 0; i < (1ULL << gLength); ++i)
-        beta_g[i].clear();
+    } else
+        for (size_t i = 0; i < (1ULL << gLength); ++i)
+            beta_g[i].clear();
 }
 
-bool zero_beta_skip_enabled()
-{
+bool zero_beta_skip_enabled() {
     static int on = getenv("GKR_NO_ZERO_BETA_SKIP") ? 0 : 1;
     return on != 0;
 }
 
-void assert_zero_beta(const vector<F> &t, const char *where, int layer)
-{
+void assert_zero_beta(const vector<F>& t, const char* where, int layer) {
     static int on = getenv("GKR_ASSERT_ZERO_BETA") ? 1 : 0;
-    if (!on) return;
+    if (!on)
+        return;
     for (size_t i = 0; i < t.size(); ++i)
         if (!t[i].isZero()) {
-            fprintf(stderr, "[zero-beta] VIOLATED at %s layer=%d idx=%zu of %zu\n",
-                    where, layer, i, t.size());
+            fprintf(stderr, "[zero-beta] VIOLATED at %s layer=%d idx=%zu of %zu\n", where, layer, i,
+                    t.size());
             abort();
         }
 }
 
-bool check(long x, long y, long nx, long ny) 
-{
+bool check(long x, long y, long nx, long ny) {
     return 0 <= x && x < nx && 0 <= y && y < ny;
 }
 
-void initLayer(layer &circuit, long size, layerType ty)
-{
+void initLayer(layer& circuit, long size, layerType ty) {
     circuit.size = circuit.zero_start_id = size;
-    // 64-bit variant: for a monolithic INPUT layer `size` is the whole model's flat
-    // witness (5.9e9 at opt2b7), which would truncate through the u32 ceilPow2BitLength.
+    // 64-bit variant
     circuit.bit_length = ceilPow2BitLength64(size);
     circuit.ty = ty;
 }
@@ -231,24 +209,28 @@ long sqr(long x) {
     return x * x;
 }
 
-double byte2KB(size_t x) { return x / 1024.0; }
+double byte2KB(size_t x) {
+    return x / 1024.0;
+}
 
-double byte2MB(size_t x) { return x / 1024.0 / 1024.0; }
+double byte2MB(size_t x) {
+    return x / 1024.0 / 1024.0;
+}
 
-double byte2GB(size_t x) { return x / 1024.0 / 1024.0 / 1024.0; }
+double byte2GB(size_t x) {
+    return x / 1024.0 / 1024.0 / 1024.0;
+}
 
-long matIdx(long x, long y, long n) { // row number , n: row len, y : column num
+long matIdx(long x, long y, long n) {  // row number , n: row len, y : column num
     assert(y < n);
     return x * n + y;
 }
 
-void field(const char* f,Fr x)
-{
-    if(x.isNegative())
-        cout<<f<<" -"<<-x<<endl;
+void field(const char* f, Fr x) {
+    if (x.isNegative())
+        cout << f << " -" << -x << endl;
     else
-        cout<<f<<" "<<x<<endl;
-    
+        cout << f << " " << x << endl;
 }
 long cubIdx(long x, long y, long z, long n, long m) {
     assert(y < n && z < m);
@@ -262,12 +244,11 @@ long tesIdx(long w, long x, long y, long z, long n, long m, long l) {
 
 F getRootOfUnit(int n) {
     F res = -F_ONE;
-    if (!n) return F_ONE;
+    if (!n)
+        return F_ONE;
     while (--n) {
         bool b = F::squareRoot(res, res);
         assert(b);
     }
     return res;
 }
-
-

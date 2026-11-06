@@ -3,7 +3,7 @@
 
 #include "fr-tensor.cuh"
 
-// This part is for light-weight "CPU" serial computations, which actually piggy-backs on the GPU implementations
+// This part is for light-weight "CPU" serial computations
 
 Fr_t operator+(const Fr_t& a, const Fr_t& b);
 Fr_t operator-(const Fr_t& a, const Fr_t& b);
@@ -12,7 +12,7 @@ Fr_t operator*(const Fr_t& a, const Fr_t& b);
 Fr_t operator/(const Fr_t& a, const Fr_t& b);
 Fr_t inv(const Fr_t& a);
 
-class Polynomial{
+class Polynomial {
 public:
     Polynomial();
     Polynomial(int degree);
@@ -41,10 +41,10 @@ public:
     static Fr_t eq(const Fr_t& u, const Fr_t& v);
 
     friend std::ostream& operator<<(std::ostream& os, const Polynomial& poly);
+
 private:
     Fr_t* coefficients_;
     int degree_;
 };
-
 
 #endif

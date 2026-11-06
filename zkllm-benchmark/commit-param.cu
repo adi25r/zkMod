@@ -1,8 +1,7 @@
 #include "fr-tensor.cuh"
 #include "commitment.cuh"
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char* argv[]) {
     string generator_filename = argv[1];
     string param_filename = argv[2];
     string output_filename = argv[3];
@@ -11,8 +10,8 @@ int main(int argc, char *argv[])
 
     Commitment generator(generator_filename);
     // generator.size has to be a power of 2
-    if (generator.size != (1 << ceilLog2(generator.size))) throw std::runtime_error("Generator size has to be a power of 2");
-
+    if (generator.size != (1 << ceilLog2(generator.size)))
+        throw std::runtime_error("Generator size has to be a power of 2");
 
     FrTensor param = FrTensor::from_int_bin(param_filename);
     cout << "Param size: " << param.size << endl;

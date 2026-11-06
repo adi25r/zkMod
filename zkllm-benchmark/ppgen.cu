@@ -1,7 +1,7 @@
 #include "commitment.cuh"
 #include <string>
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
     uint size = std::stoi(argv[1]);
     string filename = argv[2];
 

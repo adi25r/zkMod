@@ -1,6 +1,4 @@
-//
-// Created by 69029 on 3/25/2021.
-//
+// Created by 69029 on 3/25/2021
 
 #ifndef ZKCNN_TIMER_HPP
 #define ZKCNN_TIMER_HPP
@@ -24,7 +22,7 @@ public:
     using clock = std::chrono::high_resolution_clock;
     using time_point = clock::time_point;
 
-    explicit timer(bool accumulate_=true) {
+    explicit timer(bool accumulate_ = true) {
         (void)accumulate_;
         total_time_sec = 0;
         status = false;
@@ -33,7 +31,7 @@ public:
         merge_valid = false;
     }
     void start();
-    void stop(const char* out,bool total=true,bool restart=true);
+    void stop(const char* out, bool total = true, bool restart = true);
     void stop();
     void clear() {
         total_time_sec = 0;
@@ -43,8 +41,7 @@ public:
         merge_valid = false;
         merged_range = {};
     }
-    double elapse_sec() const 
-    {
+    double elapse_sec() const {
         assert(status == false);
         return total_time_sec;
     }
@@ -56,8 +53,9 @@ public:
     double lastStopEpochSec() const;
     timer_range range() const;
     void merge_timer(const timer_range);
+
 private:
-    static double toEpochSeconds(const time_point &tp);
+    static double toEpochSeconds(const time_point& tp);
 
     timer_range merged_range;
     bool merge_valid;
@@ -70,10 +68,9 @@ private:
     bool has_last_stop;
 };
 
-timer_range combine_ranges(const std::vector<timer_range> &ranges);
+timer_range combine_ranges(const std::vector<timer_range>& ranges);
 timer_range combine_ranges(std::initializer_list<timer_range> ranges);
-std::string format_range(const timer_range &range);
-double range_duration(const timer_range &range);
+std::string format_range(const timer_range& range);
+double range_duration(const timer_range& range);
 
-
-#endif //ZKCNN_TIMER_HPP
+#endif  // ZKCNN_TIMER_HPP

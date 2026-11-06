@@ -6,8 +6,7 @@
 #include "rescaling.cuh"
 #include <string>
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char* argv[]) {
     string block_input_fn = argv[1];
     string block_output_fn = argv[2];
     string output_fn = argv[3];

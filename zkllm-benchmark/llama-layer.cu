@@ -6,46 +6,45 @@ namespace {
 class ScopedTimer {
     Timer tm;
     double& acc;
+
 public:
     explicit ScopedTimer(double& a) : acc(a) { tm.start(); }
-    ~ScopedTimer() { tm.stop(); acc += tm.getTotalTime(); }
+    ~ScopedTimer() {
+        tm.stop();
+        acc += tm.getTotalTime();
+    }
 };
 
 template <typename F>
-auto timed(double& acc, F&& f) -> decltype(f())
-{
+auto timed(double& acc, F&& f) -> decltype(f()) {
     ScopedTimer st(acc);
     return f();
 }
 
-Weight load_weight(const string& workdir, uint layer_idx, const string& name, uint in_dim, uint out_dim)
-{
+Weight load_weight(const string& workdir, uint layer_idx, const string& name, uint in_dim, uint out_dim) {
     const string prefix = "layer-" + std::to_string(layer_idx);
-    return create_weight(
-        workdir + "/" + name + "-pp.bin",
-        workdir + "/" + prefix + "-" + name + "-int.bin",
-        workdir + "/" + prefix + "-" + name + "-commitment.bin",
-        in_dim, out_dim);
+    return create_weight(workdir + "/" + name + "-pp.bin", workdir + "/" + prefix + "-" + name + "-int.bin",
+                         workdir + "/" + prefix + "-" + name + "-commitment.bin", in_dim, out_dim);
 }
 
-} // namespace
+}  // namespace
 
-LayerWeights::LayerWeights(const string& workdir, uint layer_idx, const LayerDims& d):
-    input_norm(load_weight(workdir, layer_idx, "input_layernorm.weight", 1, d.embed_dim)),
-    q(load_weight(workdir, layer_idx, "self_attn.q_proj.weight", d.embed_dim, d.embed_dim)),
-    k(load_weight(workdir, layer_idx, "self_attn.k_proj.weight", d.embed_dim, d.embed_dim)),
-    v(load_weight(workdir, layer_idx, "self_attn.v_proj.weight", d.embed_dim, d.embed_dim)),
-    post_norm(load_weight(workdir, layer_idx, "post_attention_layernorm.weight", 1, d.embed_dim)),
-    up(load_weight(workdir, layer_idx, "mlp.up_proj.weight", d.embed_dim, d.hidden_dim)),
-    gate(load_weight(workdir, layer_idx, "mlp.gate_proj.weight", d.embed_dim, d.hidden_dim)),
-    down(load_weight(workdir, layer_idx, "mlp.down_proj.weight", d.hidden_dim, d.embed_dim))
-{}
+LayerWeights::LayerWeights(const string& workdir, uint layer_idx, const LayerDims& d)
+    : input_norm(load_weight(workdir, layer_idx, "input_layernorm.weight", 1, d.embed_dim)),
+      q(load_weight(workdir, layer_idx, "self_attn.q_proj.weight", d.embed_dim, d.embed_dim)),
+      k(load_weight(workdir, layer_idx, "self_attn.k_proj.weight", d.embed_dim, d.embed_dim)),
+      v(load_weight(workdir, layer_idx, "self_attn.v_proj.weight", d.embed_dim, d.embed_dim)),
+      post_norm(load_weight(workdir, layer_idx, "post_attention_layernorm.weight", 1, d.embed_dim)),
+      up(load_weight(workdir, layer_idx, "mlp.up_proj.weight", d.embed_dim, d.hidden_dim)),
+      gate(load_weight(workdir, layer_idx, "mlp.gate_proj.weight", d.embed_dim, d.hidden_dim)),
+      down(load_weight(workdir, layer_idx, "mlp.down_proj.weight", d.hidden_dim, d.embed_dim)) {}
 
-// One thread per row. Mirrors llama-rmsnorm.py: rms_inv = 1/sqrt(mean((X/sf)^2) + eps), stored as round(rms_inv*sf).
-KERNEL void llama_layer_rms_inv_kernel(const Fr_t* X, Fr_t* out, uint rows, uint cols, double eps, double sf)
-{
+// One thread per row
+KERNEL void llama_layer_rms_inv_kernel(const Fr_t* X, Fr_t* out, uint rows, uint cols, double eps,
+                                       double sf) {
     const uint row = threadIdx.x + blockIdx.x * blockDim.x;
-    if (row >= rows) return;
+    if (row >= rows)
+        return;
     double acc = 0.0;
     for (uint j = 0; j < cols; ++j) {
         const double x = static_cast<double>(scalar_to_int(X[row * cols + j])) / sf;
@@ -55,9 +54,9 @@ KERNEL void llama_layer_rms_inv_kernel(const Fr_t* X, Fr_t* out, uint rows, uint
     out[row] = double_to_scalar(1.0 / sqrt(mean + eps), static_cast<unsigned long>(sf));
 }
 
-FrTensor llama_rms_inv(const FrTensor& X, uint seq_len, uint embed_dim, double eps)
-{
-    if (X.size != seq_len * embed_dim) throw std::runtime_error("llama_rms_inv: incompatible dimensions");
+FrTensor llama_rms_inv(const FrTensor& X, uint seq_len, uint embed_dim, double eps) {
+    if (X.size != seq_len * embed_dim)
+        throw std::runtime_error("llama_rms_inv: incompatible dimensions");
     FrTensor out(seq_len);
     llama_layer_rms_inv_kernel<<<(seq_len + FrNumThread - 1) / FrNumThread, FrNumThread>>>(
         X.gpu_data, out.gpu_data, seq_len, embed_dim, eps, 65536.0);
@@ -65,12 +64,13 @@ FrTensor llama_rms_inv(const FrTensor& X, uint seq_len, uint embed_dim, double e
     return out;
 }
 
-FrTensor llama_rmsnorm(const FrTensor& X, const Weight& w, const LayerDims& d, bool prove, LayerTimers& t, BoundaryClaim* input_claim_out)
-{
+FrTensor llama_rmsnorm(const FrTensor& X, const Weight& w, const LayerDims& d, bool prove, LayerTimers& t,
+                       BoundaryClaim* input_claim_out) {
     Rescaling rs1(1 << 16), rs2(1 << 16);
     zkFC g(1, d.embed_dim, w.weight);
 
-    FrTensor rms_inv = wstore::witgen(t.compute_s, [&] { return llama_rms_inv(X, d.seq_len, d.embed_dim, d.eps); });
+    FrTensor rms_inv =
+        wstore::witgen(t.compute_s, [&] { return llama_rms_inv(X, d.seq_len, d.embed_dim, d.eps); });
     FrTensor g_inv_rms = wstore::witgen(t.compute_s, [&] { return g(rms_inv); });
     FrTensor g_inv_rms_ = wstore::rescale(t.compute_s, rs1, g_inv_rms);
     FrTensor Y = wstore::witgen(t.compute_s, [&] { return g_inv_rms_ * X; });
@@ -83,7 +83,7 @@ FrTensor llama_rmsnorm(const FrTensor& X, const Weight& w, const LayerDims& d, b
             auto v = random_vec(ceilLog2(Y.size));
             auto pf = hadamard_product_sumcheck(g_inv_rms_, X, u, v);
             if (input_claim_out) {
-                // Fr_hp_sc finishes with push_back(a(0)); push_back(b(0)); b is X folded by v.
+                // Fr_hp_sc finishes with push_back(a(0))
                 input_claim_out->v = v;
                 input_claim_out->value = pf.back();
                 input_claim_out->valid = true;
@@ -95,10 +95,10 @@ FrTensor llama_rmsnorm(const FrTensor& X, const Weight& w, const LayerDims& d, b
     return Y_;
 }
 
-FrTensor llama_attention(const FrTensor& X, const LayerWeights& w, const LayerDims& d, zkSoftmax& softmax, bool prove, LayerTimers& t)
-{
+FrTensor llama_attention(const FrTensor& X, const LayerWeights& w, const LayerDims& d, zkSoftmax& softmax,
+                         bool prove, LayerTimers& t) {
     const uint seq_len = d.seq_len;
-    const uint dim = d.embed_dim;   // single head with d = embed_dim, as in upstream self-attn.cu
+    const uint dim = d.embed_dim;
 
     zkFC q_layer(dim, dim, w.q.weight);
     zkFC k_layer(dim, dim, w.k.weight);
@@ -127,11 +127,18 @@ FrTensor llama_attention(const FrTensor& X, const LayerWeights& w, const LayerDi
     FrTensor shift(seq_len), S_shifted(seq_len * seq_len);
     vector<FrTensor> S_segments, Y_segments, m_segments;
 
-    FrTensor S = wstore::witgen(t.compute_s, [&] { return FrTensor::matmul(Q_, K_.transpose(seq_len, dim), seq_len, dim, seq_len); });
-    FrTensor Y = wstore::witgen(t.compute_s, [&] { return softmax.compute(S, shift, S_shifted, S_segments, Y_segments, m_segments); });
-    wstore::side(shift); wstore::side(S_shifted);   // softmax out-parameters, read by softmax.prove
-    wstore::side(S_segments); wstore::side(Y_segments); wstore::side(m_segments);
-    FrTensor out = wstore::witgen(t.compute_s, [&] { return FrTensor::matmul(Y, V_, seq_len, seq_len, dim); });
+    FrTensor S = wstore::witgen(
+        t.compute_s, [&] { return FrTensor::matmul(Q_, K_.transpose(seq_len, dim), seq_len, dim, seq_len); });
+    FrTensor Y = wstore::witgen(t.compute_s, [&] {
+        return softmax.compute(S, shift, S_shifted, S_segments, Y_segments, m_segments);
+    });
+    wstore::side(shift);
+    wstore::side(S_shifted);  // softmax out-parameters, read by softmax.prove
+    wstore::side(S_segments);
+    wstore::side(Y_segments);
+    wstore::side(m_segments);
+    FrTensor out =
+        wstore::witgen(t.compute_s, [&] { return FrTensor::matmul(Y, V_, seq_len, seq_len, dim); });
     FrTensor out_ = wstore::rescale(t.compute_s, rs2, out);
     FrTensor out__ = wstore::rescale(t.compute_s, rs1, out_);
 
@@ -148,7 +155,8 @@ FrTensor llama_attention(const FrTensor& X, const LayerWeights& w, const LayerDi
             zkip(claim, Y.partial_me(u1, seq_len, seq_len), V_.partial_me(u2, dim, 1), ud, proof);
 
             softmax.prove(Y, S, shift, S_shifted, S_segments, Y_segments, m_segments,
-                random_vec(ceilLog2(Y.size)), random_vec(ceilLog2(Y.size)), temp_rand[0], temp_rand[1], temp_rand[2], proof);
+                          random_vec(ceilLog2(Y.size)), random_vec(ceilLog2(Y.size)), temp_rand[0],
+                          temp_rand[1], temp_rand[2], proof);
 
             auto u1_ = random_vec(ceilLog2(seq_len));
             auto u2_ = random_vec(ceilLog2(seq_len));
@@ -160,8 +168,8 @@ FrTensor llama_attention(const FrTensor& X, const LayerWeights& w, const LayerDi
     return out__;
 }
 
-FrTensor llama_ffn(const FrTensor& X, const LayerWeights& w, const LayerDims& d, tLookupRangeMapping& swiglu, bool prove, LayerTimers& t)
-{
+FrTensor llama_ffn(const FrTensor& X, const LayerWeights& w, const LayerDims& d, tLookupRangeMapping& swiglu,
+                   bool prove, LayerTimers& t) {
     const uint seq_len = d.seq_len, embed_dim = d.embed_dim, hidden_dim = d.hidden_dim;
 
     zkFC up_layer(embed_dim, hidden_dim, w.up.weight);
@@ -194,20 +202,20 @@ FrTensor llama_ffn(const FrTensor& X, const LayerWeights& w, const LayerDims& d,
             down_rescale.prove(down_out, down_out_);
             verifyWeightClaim(w.down, down_layer.prove(down_in_, down_out)[0]);
             hidden_rescale.prove(down_in, down_in_);
-            swiglu.prove(gate_out_, swiglu_out, swiglu_m, temp_rand[0], temp_rand[1], temp_rand[2], swiglu_u, swiglu_v, swiglu_proof);
+            swiglu.prove(gate_out_, swiglu_out, swiglu_m, temp_rand[0], temp_rand[1], temp_rand[2], swiglu_u,
+                         swiglu_v, swiglu_proof);
             gate_rescale.prove(gate_out, gate_out_);
             verifyWeightClaim(w.gate, gate_layer.prove(X, gate_out)[0]);
             up_rescale.prove(up_out, up_out_);
             verifyWeightClaim(w.up, up_layer.prove(X, up_out)[0]);
         });
     }
-    // Upstream ffn.cu saves the un-rescaled down_out; the rescaled value is the layer's real output.
     return down_out_;
 }
 
-FrTensor run_layer(const FrTensor& x_in, const LayerDims& d, const LayerWeights& w, tLookupRangeMapping& swiglu, zkSoftmax& softmax,
-    bool prove, LayerTimers& t, BoundaryClaim* input_claim_out)
-{
+FrTensor run_layer(const FrTensor& x_in, const LayerDims& d, const LayerWeights& w,
+                   tLookupRangeMapping& swiglu, zkSoftmax& softmax, bool prove, LayerTimers& t,
+                   BoundaryClaim* input_claim_out) {
     FrTensor n1 = llama_rmsnorm(x_in, w.input_norm, d, prove, t, input_claim_out);
     FrTensor a = llama_attention(n1, w, d, softmax, prove, t);
     FrTensor h = wstore::witgen(t.compute_s, [&] { return x_in + a; });

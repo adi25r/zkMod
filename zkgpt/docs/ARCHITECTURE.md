@@ -37,7 +37,7 @@ GPU code is always compiled in. Paths are selected at run time. `GKR_GPU_ENABLED
 | Phase | Kernels | Default | Move it with |
 |---|---|---|---|
 | Matmul product sumcheck | `gpu_provers/gpu_matmul_prover.hpp`, `blendysc.hpp` | GPU | `GKR_MATMUL_CPU` |
-| Lasso product sumcheck | `gpu_matmul_prover.hpp`, `gpu_range_prover.hpp`, `gpu_lasso_sparse.hpp` | GPU | `GKR_LASSO_CPU` |
+| Lasso product sumcheck | `gpu_matmul_prover.hpp`, `gpu_range_prover.hpp` | GPU | `GKR_LASSO_CPU` |
 | Generic GKR sumcheck | `src/gkr_gpu.cpp` | GPU | `GKR_SC_CPU` |
 | GKR predicate reduction | `src/gkr_pred_gpu.cpp` | GPU | `GKR_PRED_CPU` |
 | Hyrax commit | `gpu_hyrax_commit.hpp`, `gpu_fr_scalars.hpp`, zkmod-gpu MSM | GPU | `--cpu-commit` |
