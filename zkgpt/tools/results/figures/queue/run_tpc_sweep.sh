@@ -1,7 +1,7 @@
 #!/bin/bash
 # Threads-per-partition sweep: fixed 192-thread budget, 1 GPU,
 # GKR_TPC = 1..32 for every arm. Arms 2-4: pinned + GPU_MAX_HW_QUEUES=1 + GKR_GPU_PROCS=12 (the
-# lassosparse settings). Arm 1: unpinned and no GPU cap, as in the fig5c gated sweep
+# lassosparse settings). Arm 1: unpinned and no GPU cap, as in the cpuhostthreadscaling gated sweep
 # (GKR_GPU_PROCS counts every child, so it would throttle the CPU arm too).
 # Logs: tools/results/speedup_analysis_models/paper_arith/logs_tpc_sweep_2026-10-24/tpc<N>/
 set -u

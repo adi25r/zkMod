@@ -47,17 +47,6 @@ pip install torch transformers numpy matplotlib
 
 `acc/` also needs `datasets` and `tqdm`.
 
-# newer scripts: slurm_h100_e2e, slurm_sm_scaling, slurm_witgen_first, slurm_early_carry_ab
-module load StdEnv/2023 python/3.11
-python -m venv .venv && source .venv/bin/activate
-pip install --no-index torch transformers numpy   # --no-index means the cluster's wheelhouse
-
-# older scripts: slurm_run, slurm_h100_zkmod, slurm_h100_pipe_sweep, verify_cuda129
-source "$HOME/miniforge3/etc/profile.d/conda.sh"; conda activate zkml312
-```
-
-The contents of `zkml312` are not recorded. The older scripts purge modules and unset `PYTHONPATH` first because the cluster's StdEnv modules conflict with that env.
-
 ## Prepare a model
 
 OPT is not gated, so the token argument can be a placeholder. `run_e2e.sh` and `run_sm_scaling.sh` do these steps themselves when a model is missing.

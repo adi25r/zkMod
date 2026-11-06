@@ -1,7 +1,6 @@
 #!/bin/bash
-# Figure 3, baseline only: latency breakdown (witgen vs prove) of the splits=1
-# monolith vs host thread count, plus a GPU-witgen arm (GPU used ONLY for witness
-# generation; proving stays on the CPU at 192 threads). x = model, series = threads.
+# zkgptbaselineprofile: latency breakdown (witgen vs prove) of the splits=1 CPU monolith
+# vs host thread count. x = model, series = threads.
 #
 # Runs strictly one at a time: the paper-layout monolith needs ~171 GiB (gpt2) /
 # ~356 GiB (opt350m) host, and a thread-scaling curve is meaningless if two runs
@@ -10,7 +9,7 @@
 # box has.
 #
 # Idempotent: a log with "All verification passed" is skipped, so a killed queue
-# can be relaunched. Timing per arm = PHASE witgen / PHASE prove wall (dur_s).
+# can be relaunched. Timing = PHASE witgen / PHASE prove wall (dur_s).
 set -u
 cd "$(dirname "$(readlink -f "$0")")/../../../.."
 LOGS=tools/results/figures/logs; mkdir -p "$LOGS"
@@ -47,15 +46,5 @@ for m in $MODELS; do
       $BIN "$L" "$attn" 1 64 "$t" "$lin" --c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit ) > "$log" 2>&1
     note "$m t=$t cpu rc=$? pass=$(grep -c 'All verification passed' "$log") $(summ "$log")"
   done
-  # GPU witgen (entire witgen on the device: FC, round, gate evaluator, all builders),
-  # CPU prove at 192 threads. No fallback: if the full port does not fit, the row fails.
-  log="$LOGS/${m}_gpuwg_full.log"
-  if done_log "$log"; then note "$m gpu witgen already done -- skip"; else
-    wait_mem "${NEED[$m]}"
-    note "=== $m GPU witgen (full port) + cpu prove ${ZK_THREADS:-192} ==="
-    ( export HIP_VISIBLE_DEVICES="${FIG_GPU:-0}" GKR_WITGEN_GPU=1 GKR_ROUND_GPU=1 GKR_GATES_GPU=1 GKR_WITGEN_FULL=1
-      $BIN "$L" "$attn" 1 64 "${ZK_THREADS:-192}" "$lin" --c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit ) > "$log" 2>&1
-    note "$m gpuwg_full rc=$? pass=$(grep -c 'All verification passed' "$log") $(summ "$log")"
-  fi
 done
-note FIG3_DONE
+note BASELINE_DONE

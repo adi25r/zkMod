@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """zkLLM baseline (monolithic, layer prover) on one H100 with its SMs capped by CUDA MPS (run_sm_scaling.sh).
 
-  python3 plots/plot_sm_scaling.py [--seq N] [--bars] [results_dir ...]      # default: every results-sm-scaling-*
+  python3 plots/plot_sm_scaling.py [--seq N] [--bars] [results_dir ...]    # default: seq 64, every results-sm-scaling-*
 
-Writes (with --seq N: only that sequence length, to sm_scaling_N.png/.pdf / sm_scaling_N.csv)
-  plots/sm_scaling.png/.pdf      end-to-end time vs SMs
-  plots/data/sm_scaling.csv      every run, plus the fit and the SM count where doubling stops paying 10%
-
---bars draws one row per model/seq instead, an end-to-end time bar per SM count, to sm_scaling[_N]_bars.png/.pdf.
-
-Times are the mean over reps with rc=0 and status=OK; error bars (--bars) are +/-1 sample std dev of e2e. SMs = the count the device reported to the capped process.
+Writes plots/figs/sm_scaling_<N>.png, .pdf and .csv. --bars draws one bar per SM count instead.
 """
 import csv
 import glob
@@ -19,12 +13,15 @@ import sys
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 import numpy as np
 
 import paperstyle as ps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+OUT = os.path.join(HERE, "figs")
+os.makedirs(OUT, exist_ok=True)
 
 MODELS = ["125m", "1.3b", "2.7b", "6.7b", "13b"]
 DOUBLING_GAIN = 0.10
@@ -62,7 +59,7 @@ def knee(a, b):
 
 
 def plot_bars(rows, seq_only, suffix):
-    """One row per series: an end-to-end time bar per SM count."""
+    """One row per series: a response time bar per SM count."""
     sms_all = sorted({s for r in rows for s, _ in r["pts"]})
     n = len(sms_all)
     fig, axes = plt.subplots(len(rows), 1, figsize=(7.0, 0.3 + 1.0 * len(rows)), squeeze=False, sharex=True)
@@ -84,14 +81,14 @@ def plot_bars(rows, seq_only, suffix):
         ax.set_ylim(0, ax.get_ylim()[1] * 1.15)
         ps.grid(ax)
     axes[-1, 0].set_xlabel("SMs")
-    fig.supylabel("End-to-end time (s)", fontsize=8, fontweight="bold")
+    fig.supylabel("Response time (s)", fontsize=8, fontweight="bold")
     fig.tight_layout(h_pad=0.3)
-    ps.save(fig, os.path.join(HERE, f"sm_scaling{suffix}_bars"))
+    ps.save(fig, os.path.join(OUT, f"sm_scaling{suffix}_bars"))
 
 
 def main():
     args = sys.argv[1:]
-    seq_only = None
+    seq_only = 64
     if "--seq" in args:
         i = args.index("--seq")
         seq_only = int(args[i + 1])
@@ -113,7 +110,7 @@ def main():
         rows.append(dict(model=m, seq=seq, pts=pts, a=a, b=b, knee=knee(a, b),
                          raw=sorted(data[(m, seq)].items())))
 
-    with open(os.path.join(HERE, "data", f"sm_scaling{suffix}.csv"), "w", newline="") as f:
+    with open(os.path.join(OUT, f"sm_scaling{suffix}.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["model", "seq_len", "sms", "n", "e2e_s", "e2e_std_s", "prove_s", "speedup_vs_min_sms",
                     "fit_sm_independent_s", "fit_sm_work_s_at_1sm", "knee_sms_10pct"])
@@ -132,19 +129,26 @@ def main():
     for i, r in enumerate(rows):
         lab = ps.name(r["model"]) + ("" if seq_only else f", seq {r['seq']}")
         xs, ys = zip(*r["pts"])
-        ax1.plot(xs, ys, ps.MARKS[i % len(ps.MARKS)] + "-", color="black", mfc="white", label=lab)
+        markers = [j for j, s in enumerate(xs) if not 64 < s < 128]
+        ax1.plot(xs, ys, ps.MARKS[i % len(ps.MARKS)] + "-", color="black", mfc="white",
+                 markevery=markers, label=lab)
     ax1.set_xscale("log", base=2)
-    ticks = [t for t in sms_all if t in (sms_all[0], 16, 32, 64, sms_all[-1])]
+    ax1.set_yscale("log")
+    ax1.set_yticks([50, 100, 200])
+    ax1.yaxis.set_major_formatter(ScalarFormatter())
+    ticks = [t for t in (8, 16, 32, 64, 128) if sms_all[0] <= t <= 128]
     ax1.set_xticks(ticks)
     ax1.set_xticklabels([str(t) for t in ticks])
+    ax1.set_xlim(sms_all[0], 128)
     ax1.minorticks_off()
     ax1.set_xlabel("SMs")
     ps.grid(ax1, "both")
-    ax1.set_ylim(0, ax1.get_ylim()[1] * 1.05)
-    ax1.set_ylabel("End-to-end time (s)")
+    times = [t for r in rows for s, t in r["pts"] if s <= 128]
+    ax1.set_ylim(min(50, min(times) / 1.15), max(times) * 1.15)
+    ax1.set_ylabel("Response time (s)")
     ax1.legend(loc="upper right")
     fig.tight_layout()
-    ps.save(fig, os.path.join(HERE, f"sm_scaling{suffix}"))
+    ps.save(fig, os.path.join(OUT, f"sm_scaling{suffix}"))
     for r in rows:
         print(f"opt-{r['model']} seq {r['seq']}: t = {r['a']:.1f} + {r['b']:.0f}/SMs  "
               f"(SM-bound share at 132: {r['b'] / 132 / (r['a'] + r['b'] / 132):.0%}, 10%-per-doubling knee ~{r['knee']:.0f} SMs)")

@@ -1,11 +1,11 @@
 #!/bin/bash
-# Paper-arithmetization 4-arm sweep. main_gkr_split proves modular-zkp's exact statement (LLMSplitBlock, probe half/half layout, merge=1,
+# Paper-arithmetization sweep: CPU witgen + CPU prove (arm1), GPU witgen + GPU prove (arm4). main_gkr_split proves modular-zkp's exact statement (LLMSplitBlock, probe half/half layout, merge=1,
 # merged range set) while keeping our runner: forked --overlapped partitions,
 # concurrent witgen, GPU witgen / GPU prover gates, same knobs as speedup_analysis*.
 # Baseline for the figures = modular-zkp's own binary (results/same_arith/logs/<m>_mz_cpu.log).
 set -u
 cd "$(dirname "$(readlink -f "$0")")/../../../../.."
-LOGS=${LOGS:-tools/results/speedup_analysis_models/paper_arith/logs}; mkdir -p "$LOGS"   # LOGS=... to write elsewhere (fig5/fig6 reruns)
+LOGS=${LOGS:-tools/results/speedup_analysis_models/paper_arith/logs}; mkdir -p "$LOGS"   # LOGS=... to write elsewhere (figure reruns)
 # ROCm 7 runtime: libamdhip64.so.7 comes from /opt/rocm-scale/lib, libomp from /opt/rocm/llvm/lib.
 export LD_LIBRARY_PATH="/opt/rocm-scale/lib:/opt/rocm/lib:/opt/rocm/llvm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export GKR_EARLY_CARRY=1   # hand the carry to partition i+1 as soon as its input values are final
@@ -56,7 +56,7 @@ tpc_for(){ local t=$(( ZK_THREADS / $2 )); (( t < 1 )) && t=1
            [[ -n "${TPC:-}" ]] && t=$TPC; echo $t; }
 note(){ echo "[$(date +%m-%d\ %H:%M:%S)] $*"; }
 LEN=${LEN:-64}; SUF=""; [[ $LEN -ne 64 ]] && SUF="_len${LEN}"   # seq-length sweep: LEN=128 ./run_paper_arith.sh gpt2
-ARMS=${ARMS:-"1 2 3 4"}                                          # ARMS="4" to run only the GPU/GPU arm
+ARMS=${ARMS:-"1 4"}                                              # ARMS="4" to run only GPU+GPU
 # EXTRA="..." is appended to every main_gkr_split command (e.g. the --vram-csv profiling runs).
 # PROFILE=1: every run also writes a 10 ms memory profile next to its log --
 #   <log>.vram.csv     device-wide VRAM of HIP device 0
@@ -99,26 +99,10 @@ for m in "${MODELS[@]}"; do
     "${BIN:-./bin/main_gkr_split}" "$L" "$attn" "$splits" "$LEN" "$ZK_THREADS" "$lin" $OVL --c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit ${EXTRA:-} $(pa "$LOGS/${m}${SUF}_arm1_cpuwg_cpuprove.log") ) > "$LOGS/${m}${SUF}_arm1_cpuwg_cpuprove.log" 2>&1
   note "$m len$LEN arm1 rc=$? $(grep -oE 'overlapped_total_s=[0-9.]+ status=\w+' $LOGS/${m}${SUF}_arm1_cpuwg_cpuprove.log) pass=$(grep -c 'All verification passed' $LOGS/${m}${SUF}_arm1_cpuwg_cpuprove.log)"
   fi
-  # GPU-prove arms (2, 4): GPU_MAX_HW_QUEUES=1 + GKR_GPU_PROCS=12 keep the MI210's HW
+  # GPU prove: GPU_MAX_HW_QUEUES=1 + GKR_GPU_PROCS=12 keep the MI210's HW
   # scheduler under its 8-process / 24-queue limit (above it the runlist time-slices every per-round
   # sync: opt350m arm4 125 -> 82.5 s, Lasso sumcheck 11 -> 1.6 s); pinned (GKR_PIN_CORES=1, slot-claim).
   # The CPU monolith uses no GPU, so neither touches the baseline.
-  # arm2: CPU witgen + GPU prove
-  if [[ " $ARMS " != *" 2 "* ]]; then :; elif done_ok "$LOGS/${m}${SUF}_arm2_cpuwg_gpuprove.log"; then note "$m arm2 already done -- skip"; else
-  note "=== $m len$LEN arm2 ==="
-  ( unset GKR_LASSO_CPU GKR_MATMUL_CPU GKR_PRED_CPU GKR_SC_CPU GKR_WITGEN_GPU GKR_ROUND_GPU
-    export GPU_MAX_HW_QUEUES=1 GKR_GPU_PROCS="${GKR_GPU_PROCS:-12}" GKR_PIN_CORES=1 GKR_BFEVAL_GPU=1 GKR_SC_STREAM_BITS=22 HIP_VISIBLE_DEVICES="${FIG_GPU:-0}" GKR_PART_VRAM_MIB="$PK_VRAM" GKR_PART_PEAK_MIB="$PK_GPU" GKR_TPC="$TPCm"
-    "${BIN:-./bin/main_gkr_split}" "$L" "$attn" "$splits" "$LEN" "$ZK_THREADS" "$lin" $OVL --c 18 --matmul-k 4 --range-k 8 --lasso-k 8 --sc-tile-bits 18 ${EXTRA:-} $(pa "$LOGS/${m}${SUF}_arm2_cpuwg_gpuprove.log") ) > "$LOGS/${m}${SUF}_arm2_cpuwg_gpuprove.log" 2>&1
-  note "$m len$LEN arm2 rc=$? $(grep -oE 'overlapped_total_s=[0-9.]+ status=\w+' $LOGS/${m}${SUF}_arm2_cpuwg_gpuprove.log) pass=$(grep -c 'All verification passed' $LOGS/${m}${SUF}_arm2_cpuwg_gpuprove.log)"
-  fi
-  # arm3: GPU witgen + CPU prove
-  if [[ " $ARMS " != *" 3 "* ]]; then :; elif done_ok "$LOGS/${m}${SUF}_arm3_gpuwg_cpuprove.log"; then note "$m arm3 already done -- skip"; else
-  note "=== $m len$LEN arm3 ==="
-  ( unset GKR_BFEVAL_GPU GKR_SC_STREAM_BITS
-    export GKR_LASSO_CPU=1 GKR_MATMUL_CPU=1 GKR_PRED_CPU=1 GKR_SC_CPU=1 GKR_WITGEN_GPU=1 GKR_ROUND_GPU=1 HIP_VISIBLE_DEVICES="${FIG_GPU:-0}" GKR_PART_PEAK_MIB="$PK_CPU" GKR_TPC="$TPCm"
-    "${BIN:-./bin/main_gkr_split}" "$L" "$attn" "$splits" "$LEN" "$ZK_THREADS" "$lin" $OVL --c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit ${EXTRA:-} $(pa "$LOGS/${m}${SUF}_arm3_gpuwg_cpuprove.log") ) > "$LOGS/${m}${SUF}_arm3_gpuwg_cpuprove.log" 2>&1
-  note "$m len$LEN arm3 rc=$? $(grep -oE 'overlapped_total_s=[0-9.]+ status=\w+' $LOGS/${m}${SUF}_arm3_gpuwg_cpuprove.log) pass=$(grep -c 'All verification passed' $LOGS/${m}${SUF}_arm3_gpuwg_cpuprove.log)"
-  fi
   # arm4: GPU witgen + GPU prove
   if [[ " $ARMS " != *" 4 "* ]]; then :; elif done_ok "$LOGS/${m}${SUF}_arm4_gpuwg_gpuprove.log"; then note "$m arm4 already done -- skip"; else
   note "=== $m len$LEN arm4 ==="

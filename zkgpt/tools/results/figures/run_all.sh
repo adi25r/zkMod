@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run every experiment behind Figures 3, 5, 6, 7, 8 and regenerate the figures.
+# Run every zkGPT experiment and regenerate the figures.
 # Everything lives in this directory: queue/ (the run scripts + their .out), logs/
 # (every run, one file each), figs/ (png + pdf + md per figure). The plotting is tools/plot_figures.py.
 #
@@ -30,16 +30,13 @@ if [[ "${1:-}" != "--plot" ]]; then
     cp bin/main_gkr_split "$BIN"
   fi
   export BIN; note "BIN=$BIN ($(md5sum < "$BIN" | cut -c1-12))"
-  note "Fig 3: baseline latency vs host threads";      THREADS="${FIG3_THREADS:-192 128 64 32 16 8 4 2 1}" $Q/run_fig3.sh
-  note "Fig 7/8: seq-len scaling + partition scaling";  $Q/run_fig7_fig8.sh
-  # Fig 3's t192 run is the len-64 monolith baseline (same flags, same binary).
+  note "zkgptbaselineprofile";                THREADS="${BASELINE_THREADS:-192 128 64 32 16 8 4 2 1}" $Q/run_zkgptbaselineprofile.sh
+  note "zkgptseqlenscaling + zkgptpartitionscaling";  $Q/run_zkgpt_scaling.sh
+  # The baseline's t192 run is the len-64 monolith (same flags, same binary).
   L=tools/results/figures/logs
   for m in gpt2 opt350m; do [[ -f $L/${m}_arm0_mono.log ]] || cp -p "$L/${m}_t192_cpu.log" "$L/${m}_arm0_mono.log"; done
-  note "Fig 5/6: all models + memory";                  FIG56_ARMS="${FIG56_ARMS:-1 2 3 4}" $Q/run_fig5_fig6.sh
-  note "Fig 5c: zkMod CPU arm vs thread budget";        $Q/run_fig5_threads_gated.sh
-  P=tools/results/speedup_analysis_models/paper_arith/_queue/run_paper_arith.sh
-  note "Fig 8 CPU: gpt2 CPU+CPU at 1..12 partitions";   for n in 1 2 3 4 5 6 7 8 9 10 11 12; do LOGS=$L SPLITS=$n ARMS=1 $P gpt2; done
-  note "GPU monolith: opt350m splits=1";                LOGS=$L SPLITS=1 ARMS=4 $P opt350m
+  note "seqlen64allcpu + seqlen64allgpu";     $Q/run_seqlen64.sh
+  note "cpuhostthreadscaling";                $Q/run_cpuhostthreadscaling.sh
 fi
 
 note "plotting"

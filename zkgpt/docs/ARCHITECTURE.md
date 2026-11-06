@@ -50,7 +50,7 @@ GPU code is always compiled in. Paths are selected at run time. `GKR_GPU_ENABLED
 | Gate evaluator witgen | same | **CPU** | `GKR_GATES_GPU` opts in |
 | Layer builders witgen | same | **CPU** | `GKR_WITGEN_FULL` opts in |
 
-The GPU witgen arms in the paper queues (arms 3 and 4) set `GKR_WITGEN_GPU` and `GKR_ROUND_GPU` only, as `gates_gpu=0 witgen_full=0` on their `SPLIT_OVERLAPPED` lines shows. Only `<model>_gpuwg_full.log` in Figure 3 runs all of witgen on the device.
+The GPU witness generation runs set `GKR_WITGEN_GPU` and `GKR_ROUND_GPU` only, as `gates_gpu=0 witgen_full=0` on their `SPLIT_OVERLAPPED` lines shows.
 
 There is no silent GPU to CPU fallback for device allocation: `HIP_CHECK` in `gpu_field.hpp` exits with status 12 on `hipErrorOutOfMemory`. One conditional path does exist: `roundLayer` runs its CPU body when the FC output is not resident.
 
@@ -137,17 +137,15 @@ Each child has its own prove-token pipe (`ptok`), and children do not return tok
 
 Host and VRAM peaks both land in `verify_lasso`. Right after it, in `verifier::prove`, phase `past_peak_free` calls `prover::release_lasso_state`, drops the verifier's beta tables, calls `malloc_trim` and fires `g_past_peak_hook`. The child posts `R`, and the parent charges measured RSS instead of a full peak, so the next prover can start.
 
-## Arms
+## Run modes
 
-Set by `tools/results/speedup_analysis_models/paper_arith/_queue/run_paper_arith.sh` and `run_paper_mono.sh`. Every run sets `ZKGPT_WITNESS_CACHE=0`, and forked arms set `GKR_EARLY_CARRY=1`.
+Set by `tools/results/speedup_analysis_models/paper_arith/_queue/run_paper_arith.sh` and `run_paper_mono.sh`. Every run sets `ZKGPT_WITNESS_CACHE=0`, and partitioned runs set `GKR_EARLY_CARRY=1`. Log names keep the internal numbers `arm0`, `arm1` and `arm4`.
 
-| Arm | Witgen | Prove | Partitions | Flags | Environment |
+| Mode | Witgen | Prove | Partitions | Flags | Environment |
 |---|---|---|---|---|---|
-| 0 | CPU | CPU | 1 | `--c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit` | `GKR_LASSO_CPU GKR_MATMUL_CPU GKR_PRED_CPU GKR_SC_CPU` |
-| 1 | CPU | CPU | default | as arm 0, `--overlapped -1` | as arm 0 |
-| 2 | CPU | GPU | default | `--overlapped -1 --c 18 --matmul-k 4 --range-k 8 --lasso-k 8 --sc-tile-bits 18` | `GPU_MAX_HW_QUEUES=1 GKR_GPU_PROCS=12 GKR_PIN_CORES=1 GKR_BFEVAL_GPU=1 GKR_SC_STREAM_BITS=22` |
-| 3 | GPU | CPU | default | as arm 1 | as arm 1, plus `GKR_WITGEN_GPU GKR_ROUND_GPU` |
-| 4 | GPU | GPU | default | as arm 2 | as arm 2, plus `GKR_WITGEN_GPU GKR_ROUND_GPU` |
+| `mono` (`arm0`) | CPU | CPU | 1 | `--c 9 --cpu --cpu-deg3 --cpu-open --cpu-commit` | `GKR_LASSO_CPU GKR_MATMUL_CPU GKR_PRED_CPU GKR_SC_CPU` |
+| `cpu` (`arm1`) | CPU | CPU | default | as `mono`, plus `--overlapped -1` | as `mono` |
+| `gpu` (`arm4`) | GPU | GPU | default | `--overlapped -1 --c 18 --matmul-k 4 --range-k 8 --lasso-k 8 --sc-tile-bits 18` | `GPU_MAX_HW_QUEUES=1 GKR_GPU_PROCS=12 GKR_PIN_CORES=1 GKR_BFEVAL_GPU=1 GKR_SC_STREAM_BITS=22 GKR_WITGEN_GPU GKR_ROUND_GPU` |
 
 Default partitions are one layer each. `TPC` defaults to `192 / partitions`, and to `192 / 3 = 64` for opt2b7 at its default split.
 
@@ -158,7 +156,7 @@ Default partitions are one layer each. `TPC` defaults to `192 / partitions`, and
 | opt1b3 | 24 | 2048 | 8192 | 24 |
 | opt2b7 | 32 | 2560 | 10240 | 32 |
 
-Arm 0 has `SPEC` entries for gpt2 and opt350m only. The opt1b3 and opt2b7 monoliths do not fit the 723 GiB box.
+`mono` has `SPEC` entries for gpt2 and opt350m only. The opt1b3 and opt2b7 monoliths do not fit the 723 GiB box.
 
 ## Invariants
 

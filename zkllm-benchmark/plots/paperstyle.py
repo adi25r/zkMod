@@ -1,9 +1,4 @@
-"""Paper style for every plot here: the same one as zkML/tools/plot_figures.py.
-
-Bars: blue gradient (light = baseline, dark = zkMod), baseline hatched. Lines: black, told apart by marker + line style.
-No titles or value labels except the speedup over the baseline above zkMod's bars/points; data/*.csv carries the rest.
-Legends stay inside the axes.
-"""
+"""Shared plot style for the zkLLM figures: blue gradient (light = baseline, dark = zkMod), baseline hatched."""
 import os
 
 import matplotlib
@@ -70,11 +65,13 @@ def pair_bars(ax, groups, base, zk, base_label, zk_label, ylabel):
     ax.set_ylabel(ylabel); grid(ax)
 
 
-def group_bars(ax, groups, series, vals, label_fmt, ylabel, size=5.5, annotate=None, legend_cols=2):
+def group_bars(ax, groups, series, vals, label_fmt, ylabel, size=5.5, annotate=None, legend_cols=2,
+               legend_title=None, legend_loc="upper left"):
     """Grouped speedup bars: one group per model, one bar per series (partition count / seq length),
     shaded light -> dark in series order. vals[g][s] = speedup or None (no run). Bars are labelled
     with their speedup only when there are few enough to keep the labels apart (annotate=None:
-    at most 10 bars); the legend goes inside the axes, above the bars."""
+    at most 10 bars). legend_loc "upper ..." reserves headroom above the bars for the legend;
+    "lower ..." lays it over the bars' lower part (it must stay below the shortest bar it covers)."""
     if annotate is None:
         annotate = len(groups) * len(series) <= 10
     x = np.arange(len(groups)); w = 0.84 / len(series)
@@ -88,11 +85,12 @@ def group_bars(ax, groups, series, vals, label_fmt, ylabel, size=5.5, annotate=N
     ax.set_xticks(x); ax.set_xticklabels([name(g, True) if not g.startswith(("GPT", "OPT")) else g for g in groups])
     ax.tick_params(axis="x", length=0)
     ax.set_ylabel(ylabel); grid(ax)
-    rows = -(-len(series) // legend_cols)
+    rows = -(-len(series) // legend_cols) if legend_loc.startswith("upper") else 0
     top = max(h for g in groups for h in vals[g].values() if h)
     ax.set_ylim(0, top * ((1.45 if annotate else 1.15) + 0.2 * rows))
-    ax.legend(loc="upper left", ncol=legend_cols, fontsize=6, columnspacing=1.0, handlelength=1.2,
-              borderaxespad=0.3, frameon=True)
+    leg = ax.legend(loc=legend_loc, ncol=legend_cols, fontsize=6, columnspacing=1.0, handlelength=1.2,
+                    borderaxespad=0.3, frameon=True, framealpha=1, title=legend_title, title_fontsize=6)
+    leg._legend_box.align = "left"
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:g}\u00d7"))
 
 

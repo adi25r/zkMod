@@ -29,3 +29,8 @@ tools/results/**
 # Stray shell-error captures (e.g. from a missing sweep script)
 *.out
 tools/.hip_pci_map
+
+# Generated figures and logs, including their .md tables
+tools/results/figures/logs/
+tools/results/figures/figs/
+tools/results/figures/smoke/

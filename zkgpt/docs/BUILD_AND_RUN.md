@@ -24,8 +24,8 @@ CMake fixes the sibling paths as `${CMAKE_CURRENT_SOURCE_DIR}/..`, so the layout
 | `./zkmod check` | Report toolchains, GPUs, dependencies, binaries, free VRAM and host memory |
 | `./zkmod deps` | Clone and build mcl, clone zkmod-gpu, at the pinned commits |
 | `./zkmod build zkgpt` | Configure into `build-scale`, build `main_gkr_split` and `zkgpt_gpu`, create the symlink `bin/main_gkr_split_witgen -> main_gkr_split` |
-| `./zkmod prove zkgpt --model M [--arm A] [--len L] [--splits N] [--gpu G]` | One run. Arm defaults to 4, `L` to 64. The log lands in `tools/results/figures/logs/`, or `LOGS`. Arm 0 accepts only gpt2 and opt350m. |
-| `./zkmod figures zkgpt --smoke [--gpu G]` | gpt2 arm 4, then plot into `tools/results/figures/smoke/` |
+| `./zkmod prove zkgpt --model M [--mode mono\|cpu\|gpu] [--len L] [--splits N] [--gpu G]` | One run. Mode defaults to `gpu`, `L` to 64. The log lands in `tools/results/figures/logs/`, or `LOGS`. Arm 0 accepts only gpt2 and opt350m. |
+| `./zkmod figures zkgpt --smoke [--gpu G]` | gpt2 `gpu` mode, then plot into `tools/results/figures/smoke/` |
 | `./zkmod figures zkgpt --full [--gpu G]` | Run `tools/results/figures/run_all.sh` |
 | `./zkmod figures zkgpt --plot [--logs DIR] [--out DIR] [fig ...]` | Plot only |
 | `./zkmod all` | `deps`, `build zkgpt`, `figures zkgpt --smoke` |
@@ -341,5 +341,5 @@ The cheats are flags: `--corrupt-layer 0..3` and `--corrupt-commit` on `bin/zkgp
 - **Wedged driver.** A process in D state at 0% CPU right after its first HIP call, with `kfd_create_process` in `/proc/<pid>/wchan`, means the KFD driver is blocked box-wide. Choosing another GPU does not help.
 - **UVM.** Do not launch new `HSA_XNACK=1` or managed sweeps, because they wedge the driver. Never `SIGKILL` a page-faulting managed run. It leaves the GPU reporting free VRAM while `hipMalloc` fails, and recovery needs `rocm-smi --gpureset`.
 - **Long queues** belong in `screen` or `nohup`.
-- **`pgrep -f 'bin/main_gkr_split'`** in `run_fig3.sh` matches any command line with that string, including a monitoring shell, and stalls the queue.
+- **`pgrep -f 'bin/main_gkr_split'`** in `run_zkgptbaselineprofile.sh` matches any command line with that string, including a monitoring shell, and stalls the queue.
 - **`kill`.** A killed run leaves `.bin.tmp<pid>` files in the witness cache directory.

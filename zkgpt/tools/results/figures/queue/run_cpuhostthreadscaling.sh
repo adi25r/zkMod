@@ -1,6 +1,6 @@
 #!/bin/bash
-# Fig 5c, memory-gated: zkMod CPU witgen + CPU prove vs TOTAL host-thread budget T,
-# seq len 64. Unlike run_fig5_threads.sh (fixed W=4 concurrent provers), this runs
+# cpuhostthreadscaling, memory-gated: zkMod CPU witgen + CPU prove vs TOTAL host-thread budget T,
+# seq len 64. This runs
 # --overlapped -1: as many partitions prove at once as the strict memory gate admits, and T is
 # split evenly across all partitions (tpc = max(1, T / splits), no GKR_TPC). Gate seeds = the
 # CPU-arm seeds of run_paper_arith.sh.
@@ -35,4 +35,4 @@ for m in $MODELS; do
     rm -f "$QUIET"; sleep 60   # window for other experiments to start between points
   done
 done
-note FIG5C_GATED_DONE
+note CPUHOSTTHREADSCALING_DONE
