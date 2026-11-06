@@ -1,0 +1,75 @@
+model,config,category,bytes
+opt-1.3b,legacy,sumcheck working set,1744830560
+opt-1.3b,legacy,lookup proof tensors,1140850688
+opt-1.3b,legacy,activations,3221225472
+opt-1.3b,legacy,"weight copies (zkFC, opening pads)",537133056
+opt-1.3b,legacy,resident layer weights,1556292880
+opt-1.3b,legacy,lookup tables,438312960
+opt-1.3b,legacy,input / other,403243008
+opt-125m,legacy,sumcheck working set,939527520
+opt-125m,legacy,lookup proof tensors,1476395008
+opt-125m,legacy,activations,788529152
+opt-125m,legacy,resident layer weights,247469328
+opt-125m,legacy,input / other,235323392
+opt-125m,legacy,lookup tables,404758528
+opt-6.7b,legacy,"weight copies (zkFC, opening pads)",8590458880
+opt-6.7b,legacy,activations,6442450944
+opt-6.7b,legacy,resident layer weights,6065374480
+opt-6.7b,legacy,lookup tables,438312960
+opt-6.7b,legacy,input / other,671973376
+opt-1.3b,blendy_untiled,sumcheck working set,3324778368
+opt-1.3b,blendy_untiled,lookup proof tensors,1140851520
+opt-1.3b,blendy_untiled,activations,3221225472
+opt-1.3b,blendy_untiled,"weight copies (zkFC, opening pads)",537133056
+opt-1.3b,blendy_untiled,lookup tables,438312960
+opt-1.3b,blendy_untiled,resident layer weights,1556292880
+opt-1.3b,blendy_untiled,input / other,403243008
+opt-125m,blendy_untiled,sumcheck working set,3230405728
+opt-125m,blendy_untiled,lookup proof tensors,1476395840
+opt-125m,blendy_untiled,activations,788529152
+opt-125m,blendy_untiled,resident layer weights,247469328
+opt-125m,blendy_untiled,input / other,235323392
+opt-125m,blendy_untiled,lookup tables,404758528
+opt-6.7b,blendy_untiled,sumcheck working set,6210459552
+opt-6.7b,blendy_untiled,lookup proof tensors,2214593344
+opt-6.7b,blendy_untiled,activations,6442450944
+opt-6.7b,blendy_untiled,"weight copies (zkFC, opening pads)",2148007936
+opt-6.7b,blendy_untiled,resident layer weights,6065374480
+opt-6.7b,blendy_untiled,lookup tables,438312960
+opt-6.7b,blendy_untiled,input / other,671973376
+opt-1.3b,blendy,lookup proof tensors,1140851520
+opt-1.3b,blendy,activations,3221225472
+opt-1.3b,blendy,sumcheck working set,525080448
+opt-1.3b,blendy,lookup tables,438312960
+opt-1.3b,blendy,"weight copies (zkFC, opening pads)",537133056
+opt-1.3b,blendy,resident layer weights,1556292880
+opt-1.3b,blendy,input / other,403243008
+opt-125m,blendy,sumcheck working set,858526816
+opt-125m,blendy,lookup proof tensors,1476395840
+opt-125m,blendy,activations,788529152
+opt-125m,blendy,resident layer weights,247469328
+opt-125m,blendy,input / other,235323392
+opt-125m,blendy,lookup tables,404758528
+opt-6.7b,blendy,"weight copies (zkFC, opening pads)",8590458880
+opt-6.7b,blendy,activations,6442450944
+opt-6.7b,blendy,lookup tables,438312960
+opt-6.7b,blendy,resident layer weights,6065374480
+opt-6.7b,blendy,input / other,671973376
+opt-1.3b,wstream,lookup proof tensors,1140851520
+opt-1.3b,wstream,activations,3221225472
+opt-1.3b,wstream,sumcheck working set,525080448
+opt-1.3b,wstream,lookup tables,438312960
+opt-1.3b,wstream,resident layer weights,79897872
+opt-1.3b,wstream,input / other,403243008
+opt-125m,wstream,sumcheck working set,858526816
+opt-125m,wstream,lookup proof tensors,1476395840
+opt-125m,wstream,activations,788529152
+opt-125m,wstream,resident layer weights,39851280
+opt-125m,wstream,input / other,235323392
+opt-125m,wstream,lookup tables,404758528
+opt-6.7b,wstream,lookup proof tensors,2214593344
+opt-6.7b,wstream,activations,6442450944
+opt-6.7b,wstream,lookup tables,438312960
+opt-6.7b,wstream,sumcheck working set,860624800
+opt-6.7b,wstream,resident layer weights,159794448
+opt-6.7b,wstream,input / other,671973376

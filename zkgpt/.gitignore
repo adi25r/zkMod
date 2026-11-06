@@ -1,0 +1,31 @@
+# Build artifacts
+/build*/
+/bin/
+
+# Profiling / run outputs
+/.rocprofv3/
+/logs/
+
+# Object files / editor / OS cruft
+*.o
+*.swp
+.DS_Store
+*.csv
+*.log
+*.pdf
+**.png
+*__pycache__/
+tools/results/**
+!tools/results/**/
+!tools/results/**/*.sh
+!tools/results/**/*.md
+!tools/results/**/qctl
+!tools/results/**/*.py
+
+# Witness cache (large binary blobs, regenerable)
+/.witness_cache/
+*.bin
+
+# Stray shell-error captures (e.g. from a missing sweep script)
+*.out
+tools/.hip_pci_map

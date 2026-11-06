@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# zkmod: compile, prove and plot for both implementations from one entry point.
+# See README.md. Run `./zkmod help` for commands.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ZKGPT="$ROOT/zkgpt"
+ZKLLM="$ROOT/zkllm-benchmark"
+
+# Dependency pins. Both are cloned as siblings of the provers because zkgpt's
+# CMakeLists.txt resolves them at ../mcl and ../zkmod-gpu.
+MCL_URL=https://github.com/herumi/mcl.git
+MCL_COMMIT=d1a53d4e1b4ef184c48adb3194db037695f97ad8
+ZKMOD_GPU_URL=https://github.com/pawks/zkmod-gpu.git
+ZKMOD_GPU_COMMIT=6c6614c
+
+BUILD_DIR=build-scale
+ZKGPT_TARGETS=(main_gkr_split zkgpt_gpu)
+
+log() { printf '[zkmod %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die() { printf '[zkmod] error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: ./zkmod <command> [args]
+
+  check                        report toolchains, GPUs, dependencies and built binaries
+  deps                         fetch and build mcl, fetch zkmod-gpu (pinned commits)
+  build zkgpt                  compile the AMD/HIP prover into zkgpt/bin
+  build zkllm [--arch sm_90]   compile the NVIDIA/CUDA prover (needs nvcc)
+
+  prove zkgpt --model M [--arm A] [--len L] [--splits N] [--gpu G]
+        M: gpt2 opt350m opt1b3 opt2b7. A: 0 monolith, 1-4 partitioned arms (default 4).
+        L defaults to 64. Log lands in tools/results/figures/logs/.
+  prove zkllm [--seq L] [--splits "4 8"] [models...]
+        Runs run_e2e.sh (needs an NVIDIA GPU and CUDA_HOME). Results land in results-h100-e2e-<L>-<id>/.
+
+  figures zkgpt --smoke [--gpu G]    gpt2 arm 4 end to end, then plot (separate logs/figs)
+  figures zkgpt --full  [--gpu G]    every row behind the paper figures, then plot
+  figures zkgpt --plot [--logs DIR] [--out DIR] [fig ...]    plot only, no proving
+  figures zkllm                      replot every zkLLM figure the local data supports
+
+  all                          deps + build zkgpt + figures zkgpt --smoke
+EOF
+}
+
+# ROCm 7 lives in /opt/rocm-scale on the MI210 box; its clang has no OpenMP, so headers and libomp come from 6.4.3.
+rocm_cmake_args() {
+  if [[ -x /opt/rocm-scale/lib/llvm/bin/clang++ ]]; then
+    printf '%s\n' \
+      -DCMAKE_HIP_COMPILER=/opt/rocm-scale/lib/llvm/bin/clang++ \
+      -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm-scale \
+      -DCMAKE_PREFIX_PATH=/opt/rocm-scale \
+      -DHIP_DIR=/opt/rocm-scale/lib/cmake/hip \
+      -Dhip_DIR=/opt/rocm-scale/lib/cmake/hip \
+      -DCMAKE_HIP_ARCHITECTURES="${ZKGPT_HIP_ARCH:-gfx90a}" \
+      "-DCMAKE_HIP_FLAGS=--rocm-path=/opt/rocm-scale -I/opt/rocm-6.4.3/lib/llvm/include" \
+      "-DZKGPT_HIP_EXTRA_FLAGS=--rocm-path=/opt/rocm-scale;-std=gnu++20;-I/opt/rocm-6.4.3/lib/llvm/include" \
+      "-DCMAKE_EXE_LINKER_FLAGS=-L/opt/rocm-scale/lib -L/opt/rocm-6.4.3/lib/llvm/lib -Wl,-rpath,/opt/rocm-scale/lib:/opt/rocm-6.4.3/lib/llvm/lib"
+  fi
+}
+
+rocm_env() {
+  if [[ -d /opt/rocm-scale/lib ]]; then
+    export LD_LIBRARY_PATH="/opt/rocm-scale/lib:/opt/rocm/lib:/opt/rocm/llvm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+}
+
+# Print the index of the AMD GPU with the least VRAM in use, requiring NEED_MIB free.
+pick_gpu() {
+  local need_mib=${1:-32768}
+  command -v rocm-smi >/dev/null || die "rocm-smi not found; pass --gpu"
+  rocm-smi --showmeminfo vram 2>/dev/null | awk -v need="$need_mib" '
+    match($0, /GPU\[[0-9]+\]/) { id = substr($0, RSTART + 4, RLENGTH - 5) }
+    /VRAM Total Memory/      { total[id] = $NF }
+    /VRAM Total Used Memory/ { used[id] = $NF }
+    END {
+      best = -1
+      for (i in total) {
+        free = (total[i] - used[i]) / 1048576
+        if (free >= need && (best < 0 || used[i] < used[best])) best = i
+      }
+      if (best < 0) exit 1
+      print best
+    }' || die "no GPU has ${need_mib} MiB of VRAM free (shared box?); wait or pass --gpu"
+}
+
+need_zkgpt_bin() {
+  [[ -x "$ZKGPT/bin/main_gkr_split" ]] || die "bin/main_gkr_split missing; run ./zkmod build zkgpt"
+}
+
+cmd_check() {
+  echo "root:        $ROOT"
+  echo "cmake:       $(command -v cmake || echo missing)"
+  echo "hipcc:       $(command -v hipcc || echo missing)"
+  echo "rocm-scale:  $([[ -x /opt/rocm-scale/lib/llvm/bin/clang++ ]] && echo present || echo absent)"
+  echo "nvcc:        $(command -v nvcc || echo missing)"
+  echo "mcl:         $([[ -f "$ROOT/mcl/lib/libmcl.so" ]] && echo built || echo 'missing (./zkmod deps)')"
+  echo "zkmod-gpu:   $([[ -f "$ROOT/zkmod-gpu/src/bls12_381.hpp" ]] && echo present || echo 'missing (./zkmod deps)')"
+  echo "zkgpt bins:  $(ls "$ZKGPT/bin" 2>/dev/null | tr '\n' ' ')"
+  python3 -c 'import matplotlib, numpy; print("plotting:    matplotlib", matplotlib.__version__, "numpy", numpy.__version__)' \
+    || echo "plotting:    matplotlib/numpy missing"
+  if command -v rocm-smi >/dev/null; then
+    rocm-smi --showmeminfo vram 2>/dev/null | awk '
+      match($0, /GPU\[[0-9]+\]/) { id = substr($0, RSTART, RLENGTH) }
+      /VRAM Total Memory/      { t = $NF }
+      /VRAM Total Used Memory/ { printf "%s free %.1f GiB\n", id, (t - $NF) / 1073741824 }'
+  fi
+  awk '/MemAvailable/ { printf "host free:   %.0f GiB\n", $2 / 1048576 }' /proc/meminfo
+}
+
+cmd_deps() {
+  if [[ ! -d "$ROOT/mcl/.git" ]]; then
+    log "cloning mcl"
+    git clone --quiet "$MCL_URL" "$ROOT/mcl"
+    git -C "$ROOT/mcl" checkout --quiet "$MCL_COMMIT"
+  fi
+  if [[ ! -f "$ROOT/mcl/lib/libmcl.so" ]]; then
+    log "building mcl (MCL_FP_BIT=384)"
+    make -C "$ROOT/mcl" -j"$(( $(nproc) > 32 ? 32 : $(nproc) ))" lib/libmcl.so MCL_FP_BIT=384 >/dev/null
+  fi
+  if [[ ! -d "$ROOT/zkmod-gpu/.git" ]]; then
+    log "cloning zkmod-gpu"
+    git clone --quiet "$ZKMOD_GPU_URL" "$ROOT/zkmod-gpu"
+    git -C "$ROOT/zkmod-gpu" checkout --quiet "$ZKMOD_GPU_COMMIT"
+  fi
+  log "deps ready: mcl $(git -C "$ROOT/mcl" rev-parse --short HEAD), zkmod-gpu $(git -C "$ROOT/zkmod-gpu" rev-parse --short HEAD)"
+}
+
+build_zkgpt() {
+  [[ -f "$ROOT/mcl/lib/libmcl.so" && -f "$ROOT/zkmod-gpu/src/bls12_381.hpp" ]] || cmd_deps
+  local args=()
+  mapfile -t args < <(rocm_cmake_args)
+  log "configuring zkgpt into $BUILD_DIR"
+  (cd "$ZKGPT" && cmake -S . -B "$BUILD_DIR" "${args[@]}" ${ZKGPT_CMAKE_ARGS:-} >/dev/null)
+  log "building ${ZKGPT_TARGETS[*]}"
+  local build_log="$ZKGPT/$BUILD_DIR/zkmod_build.log"
+  if ! (cd "$ZKGPT" && cmake --build "$BUILD_DIR" --target "${ZKGPT_TARGETS[@]}" -j"${JOBS:-32}") >"$build_log" 2>&1; then
+    grep -E 'error|undefined reference' "$build_log" | head -20 >&2 || true
+    die "build failed; full log: $build_log"
+  fi
+  for t in "${ZKGPT_TARGETS[@]}"; do [[ -x "$ZKGPT/bin/$t" ]] || die "bin/$t was not produced"; done
+  # The monolith queues default to the _witgen name; it is the same source.
+  ln -sf main_gkr_split "$ZKGPT/bin/main_gkr_split_witgen"
+  log "built: $(ls "$ZKGPT/bin" | tr '\n' ' ')"
+}
+
+build_zkllm() {
+  local arch=${ARCH:-}
+  [[ ${1:-} == --arch ]] && arch=$2
+  if ! command -v nvcc >/dev/null && [[ -z "${CUDA_HOME:-}" && -z "${CONDA_PREFIX:-}" ]]; then
+    die "zkllm needs an NVIDIA toolchain: set CUDA_HOME (CUDA 12.9, not 12.6/12.8) or activate the conda env"
+  fi
+  (cd "$ZKLLM" && make -j"${JOBS:-16}" ${arch:+ARCH=$arch} partition ppgen commit-param)
+}
+
+cmd_build() {
+  case "${1:-}" in
+    zkgpt) build_zkgpt ;;
+    zkllm) shift; build_zkllm "$@" ;;
+    *) die "build what? zkgpt or zkllm" ;;
+  esac
+}
+
+prove_zkgpt() {
+  local model="" arm=4 len=64 splits="" gpu=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model) model=$2; shift 2 ;;
+      --arm) arm=$2; shift 2 ;;
+      --len) len=$2; shift 2 ;;
+      --splits) splits=$2; shift 2 ;;
+      --gpu) gpu=$2; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [[ -n $model ]] || die "--model is required"
+  need_zkgpt_bin
+  rocm_env
+  local paper=tools/results/speedup_analysis_models/paper_arith/_queue
+  export LOGS="${LOGS:-tools/results/figures/logs}" LEN="$len"
+  cd "$ZKGPT"
+  mkdir -p "$LOGS"
+  if [[ $arm == 0 ]]; then
+    BIN="${BIN:-./bin/main_gkr_split}" "$paper/run_paper_mono.sh" "$model"
+  else
+    [[ $arm == 1 ]] || export FIG_GPU="${gpu:-$(pick_gpu 32768)}"
+    [[ -n $splits ]] && export SPLITS="$splits"
+    ARMS="$arm" BIN="${BIN:-./bin/main_gkr_split}" "$paper/run_paper_arith.sh" "$model"
+  fi
+}
+
+prove_zkllm() {
+  local seq=2048 splits="" models=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --seq) seq=$2; shift 2 ;;
+      --splits) splits=$2; shift 2 ;;
+      *) models+=("$1"); shift ;;
+    esac
+  done
+  cd "$ZKLLM"
+  command -v nvidia-smi >/dev/null || die "zkllm proving needs an NVIDIA GPU"
+  export SEQ_LEN=$seq
+  if [[ -n $splits ]]; then export PIPE_SPLITS=$splits; fi
+  ./run_e2e.sh "${models[@]}"
+}
+
+cmd_prove() {
+  case "${1:-}" in
+    zkgpt) shift; prove_zkgpt "$@" ;;
+    zkllm) shift; prove_zkllm "$@" ;;
+    *) die "prove what? zkgpt or zkllm" ;;
+  esac
+}
+
+figures_zkgpt() {
+  local mode="" gpu="" logs="" out=""
+  local figs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --smoke|--full|--plot) mode=${1#--}; shift ;;
+      --gpu) gpu=$2; shift 2 ;;
+      --logs) logs=$2; shift 2 ;;
+      --out) out=$2; shift 2 ;;
+      *) figs+=("$1"); shift ;;
+    esac
+  done
+  rocm_env
+  cd "$ZKGPT"
+  case "$mode" in
+    plot)
+      FIG_LOGS="${logs:-$PWD/tools/results/figures/logs}" FIG_OUT="${out:-$PWD/tools/results/figures/figs}" \
+        python3 tools/plot_figures.py "${figs[@]}"
+      ;;
+    smoke)
+      need_zkgpt_bin
+      local dir=$PWD/tools/results/figures/smoke
+      mkdir -p "$dir/logs" "$dir/figs"
+      LOGS="$dir/logs" prove_zkgpt --model gpt2 --arm 4 ${gpu:+--gpu "$gpu"}
+      local f="$dir/logs/gpt2_arm4_gpuwg_gpuprove.log"
+      grep -q 'status=OK' "$f" || die "smoke proof did not finish cleanly; see $f"
+      log "verified partitions: $(grep -c 'All verification passed' "$f"); $(grep -oE 'overlapped_total_s=[0-9.]+' "$f")"
+      FIG_LOGS="$dir/logs" FIG_OUT="$dir/figs" python3 tools/plot_figures.py 5ab >/dev/null
+      log "figures in $dir/figs: $(ls "$dir/figs" | wc -l) files"
+      ;;
+    full)
+      need_zkgpt_bin
+      export FIG_GPU="${gpu:-$(pick_gpu 60000)}"
+      log "full figure run on GPU $FIG_GPU; this takes many hours, run it under screen or nohup"
+      tools/results/figures/run_all.sh
+      ;;
+    *) die "figures zkgpt needs --smoke, --full or --plot" ;;
+  esac
+}
+
+figures_zkllm() {
+  cd "$ZKLLM"
+  local script ok=0 skipped=()
+  for script in plots/plot_h100_e2e.py plots/plot_h100_memory.py plots/plot_memory.py plots/plot_h100_e2e_wf.py \
+                plots/plot_paper.py plots/plot_early_carry.py plots/plot_witgen_first.py plots/plot_sm_scaling.py; do
+    if python3 "$script" >/dev/null 2>&1; then
+      ok=$((ok + 1))
+    else
+      skipped+=("$(basename "$script")")
+    fi
+  done
+  log "zkllm figures: $ok scripts ran"
+  [[ ${#skipped[@]} -eq 0 ]] || log "need results-* directories from the experiment scripts: ${skipped[*]}"
+}
+
+cmd_figures() {
+  case "${1:-}" in
+    zkgpt) shift; figures_zkgpt "$@" ;;
+    zkllm) shift; figures_zkllm "$@" ;;
+    *) die "figures of what? zkgpt or zkllm" ;;
+  esac
+}
+
+case "${1:-help}" in
+  check) cmd_check ;;
+  deps) cmd_deps ;;
+  build) shift; cmd_build "$@" ;;
+  prove) shift; cmd_prove "$@" ;;
+  figures) shift; cmd_figures "$@" ;;
+  all) cmd_deps; build_zkgpt; figures_zkgpt --smoke ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

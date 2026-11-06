@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# qctl -- stop, resume and inspect the queue_all.sh screen job.
+#
+#   qctl status            what is running, what is done, what is left
+#   qctl pause             let the run in flight finish, then wait
+#   qctl pause --now       kill the run in flight and wait   (the stage is retried)
+#   qctl resume            carry on
+#   qctl stop              let the run in flight finish, then exit
+#   qctl stop --now        kill the run in flight and exit
+#   qctl kill              kill the queue AND every run, including the older
+#                          nohup'd queue_*.sh scripts.  Nothing is preserved.
+#   qctl retry <stage>     clear a stage's done marker so it runs again
+#   qctl retry --all       clear every marker
+#
+# WHY --now KILLS RATHER THAN SUSPENDS. A measurement that shares the box is not a
+# slow measurement, it is a wrong one, so there is nothing to salvage by suspending
+# it -- and a SIGSTOPped run still holds its VRAM and its HSA queues, so the
+# neighbour you are yielding to gains nothing either. The killed stage is left
+# unmarked and comes round again on a later pass.
+#
+# Without --now the queue stops at the next stage boundary, so an hours-long cell
+# finishes and its data is kept. Use --now when someone needs the box back promptly.
+set -uo pipefail
+Q=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(dirname "$Q")
+ALL=(figs0 cpuzk gg64 gg128 gg256 cg64 cg128 cg256 cc128 cc256 figs)
+
+alive() { [[ -s $Q/.pid ]] && kill -0 "$(cat "$Q/.pid")" 2>/dev/null; }
+
+case "${1:-status}" in
+  pause|stop)
+    echo "$1" > "$Q/.control"
+    [[ "${2:-}" == "--now" ]] && { touch "$Q/.abort"; echo "abort requested"; }
+    alive || echo "note: queue_all.sh is not running (pid file stale)"
+    echo "control=$1${2:+ $2}"
+    ;;
+  resume|run)
+    echo run > "$Q/.control"; rm -f "$Q/.abort"
+    echo "control=run"
+    alive || echo "note: queue_all.sh is not running -- restart it in the screen"
+    ;;
+  kill)
+    # Everything, in the only order that works: supervisors first, so nothing
+    # relaunches a run while we are killing runs. Covers the older nohup'd queue
+    # scripts (queue_cpubase.sh, queue_seqlen.sh, queue_cpu_zkmod.sh) too -- those
+    # predate qctl and have no control file of their own.
+    #
+    # pkill -x matches the COMM exactly and -f is anchored to a path under _queue/,
+    # so neither can match the shell you typed this in. `pkill -f queue` would.
+    echo stop > "$Q/.control"; touch "$Q/.abort"
+    hit=0
+    if pkill -u "$(id -u)" -f "_queue/queue_[a-z_]*\.sh" 2>/dev/null; then
+      echo "signalled: supervisor scripts"; hit=1
+    fi
+    sleep 1
+    for c in rocprofv3 perf main_gkr_split main_gkr_split_roctx; do
+      pkill -u "$(id -u)" -x "$c" 2>/dev/null && { echo "signalled: $c"; hit=1; }
+    done
+    sleep 8
+    for c in rocprofv3 perf main_gkr_split main_gkr_split_roctx; do
+      pkill -9 -u "$(id -u)" -x "$c" 2>/dev/null && echo "SIGKILL: $c"
+    done
+    # screen writes "No screen session found." to STDOUT, which otherwise reads as
+    # an error in the middle of the kill report.
+    if screen -S char -X quit >/dev/null 2>&1; then echo "closed screen 'char'"; hit=1; fi
+    [[ $hit -eq 0 ]] && echo "nothing was running"
+    rm -f "$Q/.current"
+    echo
+    echo "still alive (should be empty):"
+    # Drop this shell and its parent: qctl's own command line contains every
+    # pattern below, so without this the report always "finds" itself still alive.
+    ps -eo pid,etime,comm,args --no-headers |
+      grep -E 'main_gkr_split|rocprofv3|[/ ]perf |_queue/queue_' | grep -v grep |
+      awk -v a="$$" -v b="$PPID" '$1!=a && $1!=b' |
+      cut -c1-140 | sed 's/^/  /'
+    echo
+    echo "nothing is marked done that was not finished; 'qctl resume' then relaunch."
+    ;;
+  retry)
+    if [[ "${2:-}" == "--all" ]]; then rm -f "$Q"/.done/*; echo "cleared every marker"
+    elif [[ -n "${2:-}" ]]; then rm -f "$Q/.done/$2"; echo "cleared $2"
+    else echo "usage: qctl retry <stage>|--all"; exit 2; fi
+    ;;
+  status)
+    printf 'control   %s\n' "$([[ -s $Q/.control ]] && cat "$Q/.control" || echo run)"
+    printf 'queue     %s\n' "$(alive && echo "running, pid $(cat "$Q/.pid")" || echo "NOT running")"
+    printf 'stage     %s\n' "$([[ -s $Q/.current ]] && cat "$Q/.current" || echo "-")"
+    printf 'box       load %s   busy_gpus %s   other_cpu %s%%   free %s\n' \
+      "$(cut -d' ' -f1 /proc/loadavg)" \
+      "$(rocm-smi --showuse 2>/dev/null | grep -c 'use (%): [1-9]')" \
+      "$(ps -eo user:24,pcpu --no-headers | awk -v me="$(id -un)" '$1!=me{s+=$2}END{printf "%d",s+0}')" \
+      "$(df -h /nvmepool | tail -1 | awk '{print $4}')"
+    echo
+    printf 'stages    '
+    for s in "${ALL[@]}"; do
+      [[ -f $Q/.done/$s ]] && printf '%s✓ ' "$s" || printf '%s· ' "$s"
+    done; echo; echo
+    echo 'processes'
+    ps -eo pid,etime,comm,args --no-headers 2>/dev/null |
+      grep -E 'main_gkr_split|rocprofv3|[/ ]perf ' | grep -v grep |
+      cut -c1-160 | sed 's/^/  /' || true
+    echo
+    echo 'last 12 log lines'
+    tail -12 "$Q/STATUS" 2>/dev/null | sed 's/^/  /'
+    ;;
+  *) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 2;;
+esac
