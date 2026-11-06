@@ -175,15 +175,3 @@ Default partitions are one layer each. `TPC` defaults to `192 / partitions`, and
 - **`circuit_s` is not witgen time.** Its timer starts in `create()` and stops at the top of `verifier::prove`. Use `witgen_s`.
 - **`timer::elapse_sec()` is cumulative**, not the last interval. Accumulating it per layer overstates the sum.
 
-## Soundness caveats
-
-These limit what an ACCEPT means. Read them before making any security claim.
-
-1. **Challenges are a Fiat-Shamir placeholder.** They come from `setByCSPRNG()`, including those in `verifyGKR`, `verifyLasso`, `hyrax` and the boundary link's `z`. They hash no transcript, so this is not a non-interactive proof as written. The prover and verifier run in one process, and a real prover could see the challenges. Never optimize by exploiting the independence of challenges from the transcript, because a real Fiat-Shamir transform removes that independence. Precomputing witness data that does not depend on challenges is fine.
-2. **`verifyLasso` does not enforce its final equality.** It computes `eval_in * gr == previousSum`, prints `All verification passed!!` if true, and returns `true` either way. `RESULT: ACCEPT` and `status=OK` therefore do not depend on this check. The only evidence is one `All verification passed` line per partition. `plot_figures.py::parse` requires that count, so plotted runs are covered.
-3. **A run's own printed verdict is the only verifier.** There is no standalone verifier binary, and the verifier reads prover state directly.
-4. **The default prompt is all zero.** Every carry is then zero, so a boundary or layout bug is invisible. Use `GKR_TEST_INPUT=<seed>` for any boundary test.
-5. **Weights are synthetic.** `readFconWeight` uses `rand()%1024`. Forked children inherit one `rand()` state and regenerate the same weights unless `ZKGPT_WEIGHT_SEED` is set, which makes them a function of the partition index. The figure queues do not set it. The proofs are consistent, but the partitions do not form one fixed model's weights. Recorded as having no timing effect (2026-10-05).
-6. **Split proofs before 2026-10-23 had no boundary link.** A prover could hand partition i+1 any input.
-7. **`--unique-parts` proofs are invalid end to end** by design.
-8. **The witness cache key does not include the input.** It is enabled by default. A hit skips witness computation, so tests with a nonzero prompt and all benchmarks should set `ZKGPT_WITNESS_CACHE=0`.
