@@ -102,3 +102,7 @@ Models are downloaded and committed on first use. Run these from `zkllm-benchmar
 ## More detail
 
 `docs/ARCHITECTURE.md` and `docs/BUILD_AND_RUN.md` in each prover cover the implementation, command-line flags, environment variables and log format.
+
+## AI disclosure
+
+This project declares AI involvement at level `copilot`. See [AI-DECLARATION.md](AI-DECLARATION.md).
